@@ -1,0 +1,114 @@
+<context>
+    <!--
+        Object model for the VICE C64 TraceRmi agent.
+
+        Hierarchy:
+          Session
+          └── C64          (Process — the emulated C64)
+              ├── Threads
+              │   └── [0]  (Thread — the 6510 CPU)
+              │       └── Stack
+              │           └── [0]  (Frame — single frame; 6502 has no call stack)
+              │               └── Registers
+              │                   └── [PC|A|X|Y|SP|P]
+              ├── Memory
+              │   └── [ram]  (MemoryRegion — full 64 KB)
+              └── Breakpoints
+                  └── [n]    (BreakpointSpec — VICE checkpoint)
+    -->
+
+    <schema name="Session" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="EventScope"/>
+        <interface name="FocusScope"/>
+        <interface name="Aggregate"/>
+        <attribute name="C64" schema="C64" required="yes" fixed="yes"/>
+        <attribute name="_event_thread" schema="OBJECT" hidden="yes"/>
+        <attribute name="_focus" schema="OBJECT" hidden="yes"/>
+        <attribute schema="VOID"/>
+    </schema>
+
+    <schema name="C64" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Activatable"/>
+        <interface name="Process"/>
+        <interface name="ExecutionStateful"/>
+        <interface name="Aggregate"/>
+        <attribute name="Threads" schema="ThreadContainer" required="yes" fixed="yes"/>
+        <attribute name="Memory" schema="MemoryContainer" required="yes" fixed="yes"/>
+        <attribute name="Breakpoints" schema="BreakpointContainer" required="yes" fixed="yes"/>
+        <attribute name="_display" schema="STRING"/>
+        <attribute name="_state" schema="STRING"/>
+    </schema>
+
+    <schema name="ThreadContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Aggregate"/>
+        <element schema="C64Thread"/>
+    </schema>
+
+    <schema name="C64Thread" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Activatable"/>
+        <interface name="Thread"/>
+        <interface name="ExecutionStateful"/>
+        <interface name="Aggregate"/>
+        <attribute name="Stack" schema="StackContainer" required="yes" fixed="yes"/>
+        <attribute name="_display" schema="STRING"/>
+        <attribute name="_state" schema="STRING"/>
+    </schema>
+
+    <schema name="StackContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Stack"/>
+        <interface name="Aggregate"/>
+        <element schema="C64Frame"/>
+    </schema>
+
+    <schema name="C64Frame" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Activatable"/>
+        <interface name="StackFrame"/>
+        <interface name="Aggregate"/>
+        <attribute name="Registers" schema="RegisterContainer" required="yes" fixed="yes"/>
+        <attribute name="PC" schema="ADDRESS" required="yes"/>
+        <attribute-alias from="_pc" to="PC"/>
+        <attribute name="_display" schema="STRING"/>
+    </schema>
+
+    <schema name="RegisterContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="RegisterContainer"/>
+        <interface name="Aggregate"/>
+        <element schema="Register"/>
+    </schema>
+
+    <schema name="Register" elementResync="NEVER" attributeResync="NEVER">
+        <interface name="Register"/>
+        <attribute name="_display" schema="STRING"/>
+        <attribute name="value" schema="INT"/>
+    </schema>
+
+    <schema name="MemoryContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Memory"/>
+        <interface name="Aggregate"/>
+        <element schema="MemoryRegion"/>
+    </schema>
+
+    <schema name="MemoryRegion" elementResync="NEVER" attributeResync="NEVER">
+        <interface name="MemoryRegion"/>
+        <attribute name="_display" schema="STRING"/>
+        <attribute name="_range" schema="RANGE"/>
+        <attribute name="_readable" schema="BOOL"/>
+        <attribute name="_writable" schema="BOOL"/>
+        <attribute name="_executable" schema="BOOL"/>
+    </schema>
+
+    <schema name="BreakpointContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Aggregate"/>
+        <element schema="ViceBreakpoint"/>
+    </schema>
+
+    <schema name="ViceBreakpoint" elementResync="NEVER" attributeResync="NEVER">
+        <interface name="BreakpointSpec"/>
+        <interface name="BreakpointLocation"/>
+        <attribute name="_display" schema="STRING"/>
+        <attribute name="_range" schema="RANGE"/>
+        <attribute name="_enabled" schema="BOOL"/>
+        <attribute name="_kinds" schema="STRING"/>
+    </schema>
+
+</context>

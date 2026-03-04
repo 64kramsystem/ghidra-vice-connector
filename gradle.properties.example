@@ -1,0 +1,2 @@
+# Copy this file to gradle.properties and set your Ghidra 12 installation path.
+GHIDRA_INSTALL_DIR=/path/to/ghidra_12.0

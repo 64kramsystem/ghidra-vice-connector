@@ -1,0 +1,46 @@
+// Ghidra Extension build for VICE C64 TraceRmi agent.
+// Requires GHIDRA_INSTALL_DIR env var or Gradle property.
+
+def ghidraInstallDir
+if (System.env.GHIDRA_INSTALL_DIR) {
+    ghidraInstallDir = System.env.GHIDRA_INSTALL_DIR
+} else if (project.hasProperty("GHIDRA_INSTALL_DIR")) {
+    ghidraInstallDir = project.getProperty("GHIDRA_INSTALL_DIR")
+}
+
+if (ghidraInstallDir) {
+    apply from: new File(ghidraInstallDir).getCanonicalPath() + "/support/buildExtension.gradle"
+} else {
+    throw new GradleException("GHIDRA_INSTALL_DIR is not defined!")
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+}
+
+// Preserve executable bit on shell launcher scripts in the zip.
+// Exclude Python bytecode, test artifacts, and dev files from the extension zip.
+tasks.named('buildExtension') {
+    filesMatching('**/*.sh') {
+        permissions {
+            unix('rwxr-xr-x')
+        }
+    }
+    exclude '**/__pycache__/**'
+    exclude '**/*.pyc'
+    exclude '**/.pytest_cache/**'
+    exclude '.claude/**'
+    exclude 'tests/**'
+    exclude 'test_vice.py'
+    exclude 'pytest.ini'
+    exclude 'data/ghidra-project/**'
+    exclude 'data/test_raw.bin'
+
+    // Include Python agent source (buildExtension.gradle excludes src/** by default)
+    from('src/main/py/src') {
+        into "${project.name}/src/main/py/src"
+    }
+}

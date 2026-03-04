@@ -1,0 +1,25 @@
+# Gradle
+.gradle/
+build/
+dist/
+
+# Ghidra install dir (set locally in gradle.properties)
+gradle.properties
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.class
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+data/test_raw.bin
+data/ghidra-project/
