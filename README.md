@@ -117,7 +117,7 @@ pip install pytest
 pytest
 ```
 
-CI (`.github/workflows/build.yml`) resolves the latest Ghidra **12.1** release, builds the extension with JDK 21, runs the test suite, and on `master` publishes a version-matched release artifact.
+CI (`.github/workflows/build.yml`) resolves the latest Ghidra **12.1** release, builds the extension with JDK 21, runs the test suite, and on `master` publishes a version-matched release artifact. A Linux-only GUI smoke test (`test/gui-smoke/run.sh`) installs the packaged extension into a real Ghidra GUI under Xvfb and starts VICE; it gates on the deterministic parts (the extension installs and is accepted by Ghidra 12.1, the fixture imports, the VICE monitor opens) and best-effort probes the end-to-end debugger launch. It is informational and does not gate releases — the `xdotool` driving of the launch dialog still needs tuning on a Linux runner.
 
 ## License
 
