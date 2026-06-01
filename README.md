@@ -1,6 +1,6 @@
 # Ghidra VICE Connector
 
-A Ghidra debugger extension that connects to the [VICE](https://vice-emu.sourceforge.io/) Commodore 64 emulator via its Binary Monitor Protocol. It uses Ghidra's TraceRmi framework (Ghidra 11.3+) to provide live debugging of 6502/6510 code running in VICE.
+A Ghidra debugger extension that connects to the [VICE](https://vice-emu.sourceforge.io/) Commodore 64 emulator via its Binary Monitor Protocol. It uses Ghidra's TraceRmi framework (Ghidra 12.1) to provide live debugging of 6502/6510 code running in VICE.
 
 ## Features
 
@@ -13,16 +13,19 @@ A Ghidra debugger extension that connects to the [VICE](https://vice-emu.sourcef
 
 ## Prerequisites
 
-- **Ghidra** 11.3 or later (with TraceRmi support)
+- **Ghidra** 12.1 (uses the TraceRmi framework)
+- **JDK 21** — required to *build* the extension. Ghidra 12.1 targets Java 21; the Gradle build fails under newer JDKs (e.g. JDK 26 errors with `Unsupported class file major version 70`).
 - **VICE** with Binary Monitor Protocol enabled
 - **Python 3** with the `ghidratrace` package installed (from Ghidra's `Debugger-rmi-trace` module or via pip)
 
 ## Building
 
-Set `GHIDRA_INSTALL_DIR` to your Ghidra installation, then build with Gradle:
+Set `GHIDRA_INSTALL_DIR` to your Ghidra 12.1 installation and build with Gradle, using JDK 21:
 
 ```sh
-GHIDRA_INSTALL_DIR=/path/to/ghidra ./gradlew buildExtension
+JAVA_HOME=/path/to/jdk-21 \
+GHIDRA_INSTALL_DIR=/path/to/ghidra_12.1_PUBLIC \
+./gradlew buildExtension
 ```
 
 The extension zip will be in `dist/`.

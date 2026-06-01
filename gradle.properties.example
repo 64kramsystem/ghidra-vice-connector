@@ -1,2 +1,3 @@
-# Copy this file to gradle.properties and set your Ghidra 12 installation path.
-GHIDRA_INSTALL_DIR=/path/to/ghidra_12.0
+# Copy this file to gradle.properties and set your Ghidra 12.1 installation path.
+# Build with JDK 21 (Ghidra 12.1 targets Java 21; newer JDKs break the Gradle build).
+GHIDRA_INSTALL_DIR=/path/to/ghidra_12.1_PUBLIC
