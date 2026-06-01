@@ -33,6 +33,7 @@ tasks.named('buildExtension') {
     exclude '**/*.pyc'
     exclude '**/.pytest_cache/**'
     exclude '.claude/**'
+    exclude '.github/**'
     exclude 'tests/**'
     exclude 'test_vice.py'
     exclude 'pytest.ini'
