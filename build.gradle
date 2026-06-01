@@ -35,6 +35,7 @@ tasks.named('buildExtension') {
     exclude '.claude/**'
     exclude '.github/**'
     exclude 'tests/**'
+    exclude 'test/**'
     exclude 'test_vice.py'
     exclude 'pytest.ini'
     exclude 'data/ghidra-project/**'

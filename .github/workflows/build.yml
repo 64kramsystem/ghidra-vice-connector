@@ -91,9 +91,112 @@ jobs:
     - name: Run tests
       run: pytest
 
+  # GUI smoke test: install the *packaged* extension into a real Ghidra 12.1
+  # GUI under Xvfb and a running VICE binary monitor. run.sh GATES on the
+  # deterministic parts (extension installs and is accepted by Ghidra 12.1,
+  # fixture imports, VICE monitor opens) and PROBES the end-to-end debugger
+  # launch best-effort (warns, does not fail).
+  #
+  # continue-on-error: the xdotool driving of Ghidra's launch dialog is
+  # timing-/UI-revision-sensitive and is not yet confirmed on a runner; the job
+  # is informational (never fails the workflow, not a release dependency) and
+  # also tolerates environment gaps such as VICE ROM availability.
+  gui-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+
+    - name: Install GUI + emulator dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          xvfb xauth util-linux metacity xdotool netcat-openbsd imagemagick \
+          unzip curl wget vice
+
+    # Ubuntu's `vice` package ships the emulator but NOT the copyrighted C64
+    # ROMs, so x64sc aborts at startup ("Couldn't load kernal ROM"). Fetch the
+    # GPL-distributed ROMs from VICE upstream; run.sh passes them to x64sc.
+    - name: Provision VICE C64 ROMs
+      run: |
+        ROM_DIR="$RUNNER_TEMP/vice-roms/C64"
+        mkdir -p "$ROM_DIR"
+        BASE=https://raw.githubusercontent.com/VICE-Team/svn-mirror/main/vice/data/C64
+        for spec in \
+          kernal-901227-03.bin:8192 \
+          basic-901226-01.bin:8192 \
+          chargen-901225-01.bin:4096
+        do
+          rom=${spec%%:*}
+          expected=${spec##*:}
+          curl -fsSL "$BASE/$rom" -o "$ROM_DIR/$rom"
+          actual=$(wc -c < "$ROM_DIR/$rom" | tr -d '[:space:]')
+          if [ "$actual" != "$expected" ]; then
+            echo "ROM size mismatch: $rom expected $expected bytes, got $actual bytes" >&2
+            exit 1
+          fi
+        done
+        echo "VICE_C64_ROM_DIR=$ROM_DIR" >> "$GITHUB_ENV"
+
+    - name: Find latest Ghidra 12.1 release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        GHIDRA_URL=$(gh api repos/NationalSecurityAgency/ghidra/releases \
+          --jq '[.[] | select(.tag_name | test("^Ghidra_12\\.1(?:\\.[0-9]+)?_build$"))][0].assets
+            | map(select(.name | test("^ghidra_12\\.1(?:\\.[0-9]+)?_PUBLIC_[0-9]+\\.zip$")))
+            | .[0].browser_download_url')
+        echo "GHIDRA_URL=$GHIDRA_URL" >> "$GITHUB_ENV"
+        GHIDRA_DIR=$(basename "$GHIDRA_URL" .zip | sed 's/_[0-9]*$//')
+        echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
+        echo "Resolved Ghidra release: $GHIDRA_DIR"
+
+    - name: Download Ghidra
+      run: |
+        # Keep the install out of the checkout (parity with the build job).
+        wget --no-verbose -O "$RUNNER_TEMP/ghidra.zip" "$GHIDRA_URL"
+        7z x -bd -o"$RUNNER_TEMP" "$RUNNER_TEMP/ghidra.zip"
+        echo "GHIDRA_HOME=$RUNNER_TEMP/$GHIDRA_DIR" >> "$GITHUB_ENV"
+
+    - name: Install ghidratrace from the Ghidra distribution
+      run: |
+        pip install "$GHIDRA_HOME"/Ghidra/Debug/Debugger-rmi-trace/pypkg/
+
+    - name: Download packaged extension artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: ghidra-vice-connector
+        path: dist
+
+    - name: Run GUI smoke test
+      run: |
+        EXT_ZIP=$(ls -t dist/*.zip | head -1)
+        echo "Extension ZIP: $EXT_ZIP"
+        bash test/gui-smoke/run.sh "$EXT_ZIP"
+
+    # Always upload: run.sh captures step screenshots + logs into this dir even
+    # on the green-but-probe-warned path, which is exactly what is needed to
+    # tune the launch automation.
+    - name: Upload GUI smoke diagnostics
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: gui-smoke-diagnostics
+        path: ${{ runner.temp }}/gui-smoke-artifacts/**
+        if-no-files-found: ignore
+
   # Version-matched release on push to master / manual dispatch. Consumes the
   # Ghidra version resolved by `build` (via job outputs) so a new Ghidra release
-  # landing mid-run cannot mislabel the artifact.
+  # landing mid-run cannot mislabel the artifact. gui-smoke is intentionally not
+  # a dependency: it is informational, not a release gate.
   release:
     needs: [build, python-tests]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch'
