@@ -123,24 +123,28 @@ jobs:
           unzip curl wget vice
 
     # Ubuntu's `vice` package ships the emulator but NOT the copyrighted C64
-    # ROMs, so x64sc aborts at startup ("Couldn't load kernal ROM"). Fetch the
-    # GPL-distributed ROMs from VICE upstream; run.sh passes them to x64sc.
+    # ROMs. Fetch the GPL-distributed ROMs from VICE upstream; run.sh passes them
+    # to x64sc. NB: VICE 3.7.1 logs "Couldn't load kernal ROM" for a byte-identical
+    # kernal but still injects and runs the PRG, so the smoke test gates on
+    # autostart success rather than kernal load (see run.sh vice_boot_ready).
     - name: Provision VICE C64 ROMs
       run: |
         ROM_DIR="$RUNNER_TEMP/vice-roms/C64"
         mkdir -p "$ROM_DIR"
         BASE=https://raw.githubusercontent.com/VICE-Team/svn-mirror/main/vice/data/C64
+        # rom:sha256 — pin exact bytes (subsumes the old size check) so an upstream
+        # change or a truncated/HTML download is caught before x64sc runs.
         for spec in \
-          kernal-901227-03.bin:8192 \
-          basic-901226-01.bin:8192 \
-          chargen-901225-01.bin:4096
+          kernal-901227-03.bin:83c60d47047d7beab8e5b7bf6f67f80daa088b7a6a27de0d7e016f6484042721 \
+          basic-901226-01.bin:89878cea0a268734696de11c4bae593eaaa506465d2029d619c0e0cbccdfa62d \
+          chargen-901225-01.bin:fd0d53b8480e86163ac98998976c72cc58d5dd8eb824ed7b829774e74213b420
         do
           rom=${spec%%:*}
           expected=${spec##*:}
           curl -fsSL "$BASE/$rom" -o "$ROM_DIR/$rom"
-          actual=$(wc -c < "$ROM_DIR/$rom" | tr -d '[:space:]')
+          actual=$(sha256sum "$ROM_DIR/$rom" | cut -d' ' -f1)
           if [ "$actual" != "$expected" ]; then
-            echo "ROM size mismatch: $rom expected $expected bytes, got $actual bytes" >&2
+            echo "ROM sha256 mismatch: $rom expected $expected, got $actual" >&2
             exit 1
           fi
         done
