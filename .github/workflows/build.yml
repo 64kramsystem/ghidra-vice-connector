@@ -123,8 +123,10 @@ jobs:
           unzip curl wget vice
 
     # Ubuntu's `vice` package ships the emulator but NOT the copyrighted C64
-    # ROMs, so x64sc aborts at startup ("Couldn't load kernal ROM"). Fetch the
-    # GPL-distributed ROMs from VICE upstream; run.sh passes them to x64sc.
+    # ROMs. Fetch the GPL-distributed ROMs from VICE upstream; run.sh passes them
+    # to x64sc. NB: VICE 3.7.1 logs "Couldn't load kernal ROM" for a byte-identical
+    # kernal but still injects and runs the PRG, so the smoke test gates on
+    # autostart success rather than kernal load (see run.sh vice_boot_ready).
     - name: Provision VICE C64 ROMs
       run: |
         ROM_DIR="$RUNNER_TEMP/vice-roms/C64"
