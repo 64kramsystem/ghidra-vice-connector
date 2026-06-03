@@ -207,17 +207,17 @@ find "$USER_SETTINGS/Extensions" -name '*.sh' -exec chmod +x {} \;
 
 # --- Phase 4: import_fixture ----------------------------------------------
 PHASE="import_fixture"
-# Ghidra imports raw 6502 code, so strip the 2-byte PRG load-address header
-# (same transform the README documents for producing data/test_raw.bin).
-RAW_BIN="$TMP_BASE/test_raw.bin"
-python3 -c "import pathlib,sys; b=pathlib.Path('$REPO_ROOT/data/test.prg').read_bytes(); pathlib.Path('$RAW_BIN').write_bytes(b[2:])"
-[ -s "$RAW_BIN" ] || { die "failed to derive raw fixture from test.prg"; exit 1; }
+# Import via the PACKAGED helper so the smoke test also covers its packaging:
+# it reads the load address from the PRG header and imports at that base.
+IMPORT_HELPER=$(find "$USER_SETTINGS/Extensions" -path '*/data/support/import-prg.sh' | head -1)
+[ -n "$IMPORT_HELPER" ] && [ -f "$IMPORT_HELPER" ] || { die "import-prg.sh not found in the installed extension"; exit 1; }
 mkdir -p "$PROJECT_PARENT"
-"$GHIDRA_HOME"/support/analyzeHeadless \
-  "$PROJECT_PARENT" "$PROJECT_NAME" \
-  -import "$RAW_BIN" \
-  -processor "6502:LE:16:default" \
-  >"$TMP_BASE/analyzeHeadless.log" 2>&1
+if ! "$IMPORT_HELPER" "$REPO_ROOT/data/test.prg" "$PROJECT_PARENT" "$PROJECT_NAME" \
+    >"$TMP_BASE/analyzeHeadless.log" 2>&1; then
+  die "import helper failed"
+  tail -40 "$TMP_BASE/analyzeHeadless.log"
+  exit 1
+fi
 if [ ! -f "$PROJECT_PARENT/$PROJECT_NAME.gpr" ]; then
   die "project file not created"
   tail -40 "$TMP_BASE/analyzeHeadless.log"

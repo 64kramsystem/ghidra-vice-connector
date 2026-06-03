@@ -82,21 +82,9 @@ rm -rf $HOME/.config/ghidra/$GHIDRA_VER/Extensions/ghidra-vice-connector
 unzip -q dist/$GHIDRA_VER_*_ghidra-vice-connector.zip -d $HOME/.config/ghidra/$GHIDRA_VER/Extensions/
 
 # Once: prepare test program and Ghidra project
+# (imports at the load address from the PRG header — no manual stripping/rebasing)
 
-python3 -c "
-import pathlib
-prg = pathlib.Path('data/test.prg').read_bytes()
-pathlib.Path('data/test_raw.bin').write_bytes(prg[2:])
-"
-$GHIDRA_PATH/support/analyzeHeadless \
-  data/ghidra-project ViceTest \
-  -import data/test_raw.bin \
-  -processor "6502:LE:16:default" \
-  -cspec default \
-  -loader BinaryLoader \
-  -postScript RebaseToC64Load.java \
-  -scriptPath data/ghidra-scripts \
-  -overwrite
+GHIDRA_HOME=$GHIDRA_PATH data/support/import-prg.sh data/test.prg data/ghidra-project ViceTest
 
 # Prepare and open the project
 #
