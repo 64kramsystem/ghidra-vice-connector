@@ -9,16 +9,21 @@
 #@menu-group vice
 #@icon icon.debugger
 #@help TraceRmiLauncherServicePlugin#vice_c64
+#@depends Debugger-rmi-trace
 #@env OPT_PYTHON_EXE:file="python3" "Python command" "Path to the Python 3 interpreter"
 #@env OPT_HOST:str="localhost" "VICE Host" "Hostname or IP of the machine running VICE"
 #@env OPT_PORT:int=6502 "VICE Port" "Binary Monitor TCP port (VICE default: 6502)"
+
+. "$MODULE_Debugger_rmi_trace_HOME/data/support/setuputils.sh"
 
 # Resolve extension root from this script's location:
 # data/debugger-launchers/vice-c64.sh -> up two levels -> extension root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-pypathTrace="$MODULE_Debugger_rmi_trace_HOME/pypkg/src"
+# ghidra-module-pypath resolves installed (pypkg/src) and dev (build/pypkg/src) layouts. The VICE
+# package keeps its own path: this extension does not use the pypkg layout.
+pypathTrace=$(ghidra-module-pypath "Debugger-rmi-trace")
 pypathVice="$EXT_ROOT/src/main/py/src"
 
 # Discover the Python site-packages path so pip-installed ghidratrace (which
