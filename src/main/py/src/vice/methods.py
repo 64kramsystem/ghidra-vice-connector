@@ -16,7 +16,11 @@ from .util import CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE
 
 log = logging.getLogger('vice-agent')
 
-REGISTRY = MethodRegistry(ThreadPoolExecutor())
+# Single worker: Ghidra method calls execute in order, as in the official TraceRmi agents.
+REGISTRY = MethodRegistry(ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix='MethodRegistry',
+))
 
 
 # ── Schema type stubs (match names in schema.xml) ────────────────────────────
