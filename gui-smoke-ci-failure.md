@@ -19,8 +19,12 @@ The kernal CI downloads is byte-identical to the known-good ROM — both SHA1 `1
 
 Why 3.7.1 refuses a valid kernal, and/or whether 3.7.1 even emits the `Kernal rev #3` marker at all (it may be a newer-VICE log string). Testable locally: the distro `/usr/bin/x64sc` is 3.7.1. See `local-gui-smoke-repro-env.md`.
 
-## Likely fix direction (not yet implemented)
+## Fix (implemented and CI-verified)
 
-Relax the run.sh boot gate so it does not hinge on the `Kernal rev #3` string — the real success signals already present are the monitor port opening and `AUTOSTART: Done.`.
+Commit `ec4c2f9` relaxed `vice_boot_ready()` to gate on the real contract — monitor port open (already checked) plus fixture autostart success (`AUTOSTART: Done.`) — instead of the `Kernal rev #3` log string, and pinned the CI-provisioned ROMs by sha256 (subsumes the old size check).
 
-Do NOT commit the C64 ROMs into the repo to "fix" this: they are copyrighted (that is exactly why the distro omits them), so bundling them in a public repo is legally dubious.
+Verified: CI run 26854133172 is the first green `gui-smoke` job (`build`/`python-tests` green as before). The later deterministic gates (`launch_ghidra`, `assert_extension_loaded`) were exercised in CI for the first time and passed.
+
+Still open (best-effort, non-gating, by design): the end-to-end probe does not reach "Agent ready" — the xdotool "Open With → Debugger" navigation opens the context menu but the submenu click never lands, so the Debugger tool and launcher are never triggered (`vice-agent.log` absent; step screenshots 02–04 are byte-identical, 05–07 match the pre-menu frame). The `gui-smoke-diagnostics` artifact of that run has the screenshots for tuning.
+
+Note: a self-contained bundled VICE 3.10 (binary + data) was prototyped as an alternative fix and dropped — the gate relaxation made it unnecessary. The C64 ROMs themselves are redistributable (they ship in Debian packages), so bundling remains a viable option if a version-pinned emulator is ever wanted.
