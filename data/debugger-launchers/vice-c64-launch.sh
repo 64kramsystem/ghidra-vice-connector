@@ -10,12 +10,15 @@
 #@icon icon.debugger
 #@help TraceRmiLauncherServicePlugin#vice_c64
 #@depends Debugger-rmi-trace
+#@enum LogLevel:str DEBUG INFO WARNING ERROR
 #@env OPT_VICE_PATH:file="x64sc" "VICE command" "Path to the VICE C64 emulator (x64sc or x64). Omit the full path to resolve using the system PATH."
 #@env OPT_PRG_FILE:file="" "PRG image" "Optional .prg program to autostart, empty to just boot BASIC"
 #@env OPT_HOST:str="127.0.0.1" "Monitor host" "Address the binary monitor binds to"
 #@env OPT_PORT:int=6502 "Monitor port" "Binary Monitor TCP port (VICE default: 6502)"
 #@env OPT_EXTRA_VICE_ARGS:str="" "Extra VICE args" "Additional arguments passed to VICE"
 #@env OPT_PYTHON_EXE:file="python3" "Python command" "Path to the Python 3 interpreter"
+#@env OPT_LOG_FILE:file="/tmp/vice-agent.log" "Log file" "Agent log file path"
+#@env OPT_LOG_LEVEL:LogLevel="DEBUG" "Log level" "Agent log verbosity"
 
 . "$MODULE_Debugger_rmi_trace_HOME/data/support/setuputils.sh"
 
