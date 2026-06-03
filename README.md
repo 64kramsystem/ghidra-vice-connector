@@ -108,6 +108,17 @@ $GHIDRA_PATH/ghidraRun $PWD/data/ghidra-project/ViceTest.gpr
 # Attach debugger: Debugger → Configure and Launch… → VICE…
 ```
 
+## Development
+
+Run the Python agent test suite (the live-VICE tests auto-skip when no emulator is reachable):
+
+```sh
+pip install pytest
+pytest
+```
+
+CI (`.github/workflows/build.yml`) resolves the latest Ghidra **12.1** release, builds the extension with JDK 21, and runs the test suite.
+
 ## License
 
 See the repository for license information.

@@ -1,0 +1,86 @@
+name: Build
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same ref (PR/branch).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build the Ghidra extension against the latest Ghidra 12.1 release.
+  #
+  # The build is version-agnostic (build.gradle applies the Ghidra install's own
+  # support/buildExtension.gradle), so CI just needs the full Ghidra install on
+  # disk and GHIDRA_INSTALL_DIR pointing at it. JDK 21 is required: Ghidra 12.1
+  # targets Java 21, and the Gradle 9.2.1 wrapper does not run under newer JDKs.
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v5
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: gradle
+
+    - name: Find latest Ghidra 12.1 release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        GHIDRA_URL=$(gh api repos/NationalSecurityAgency/ghidra/releases \
+          --jq '[.[] | select(.tag_name | test("^Ghidra_12\\.1(?:\\.[0-9]+)?_build$"))][0].assets
+            | map(select(.name | test("^ghidra_12\\.1(?:\\.[0-9]+)?_PUBLIC_[0-9]+\\.zip$")))
+            | .[0].browser_download_url')
+        echo "GHIDRA_URL=$GHIDRA_URL" >> "$GITHUB_ENV"
+        # Extract dir name: ghidra_12.1_PUBLIC (strip date suffix and .zip)
+        GHIDRA_DIR=$(basename "$GHIDRA_URL" .zip | sed 's/_[0-9]*$//')
+        echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
+        echo "Resolved Ghidra release: $GHIDRA_DIR"
+
+    - name: Download Ghidra
+      run: |
+        # Extract OUTSIDE the checkout: Ghidra's buildExtension zips the project
+        # root, so an in-tree Ghidra install (~1 GB) would be bundled into the
+        # extension artifact. $RUNNER_TEMP keeps it off the packaged tree.
+        wget --no-verbose -O "$RUNNER_TEMP/ghidra.zip" "$GHIDRA_URL"
+        7z x -bd -o"$RUNNER_TEMP" "$RUNNER_TEMP/ghidra.zip"
+        echo "GHIDRA_INSTALL_DIR=$RUNNER_TEMP/$GHIDRA_DIR" >> "$GITHUB_ENV"
+
+    - name: Build extension
+      run: ./gradlew --no-daemon clean buildExtension
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: ghidra-vice-connector
+        path: dist/*.zip
+        if-no-files-found: error
+
+  # Unit/integration tests for the Python TraceRmi agent. conftest.py stubs the
+  # ghidratrace modules, so no Ghidra install is needed; the live-VICE suite
+  # auto-skips when no emulator is reachable. Runs in parallel with build.
+  python-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+
+    - name: Install pytest
+      run: pip install pytest
+
+    - name: Run tests
+      run: pytest
