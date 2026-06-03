@@ -72,8 +72,8 @@ jobs:
         if-no-files-found: error
 
   # Unit/integration tests for the Python TraceRmi agent. conftest.py stubs the
-  # ghidratrace modules, so no Ghidra install is needed; the live-VICE suite
-  # auto-skips when no emulator is reachable. Runs in parallel with build.
+  # ghidratrace modules, so no Ghidra install is needed; the live-VICE suite runs
+  # against a headless x64sc booted below. Runs in parallel with build.
   python-tests:
     runs-on: ubuntu-latest
 
@@ -88,7 +88,38 @@ jobs:
     - name: Install pytest
       run: pip install pytest
 
+    - name: Install VICE
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends vice xvfb netcat-openbsd
+
+    - name: Provision VICE C64 ROMs
+      uses: ./.github/actions/provision-vice-roms
+
+    # The live-VICE suite (tests/test_live_vice.py) needs only a booted machine with the
+    # binary monitor open — no PRG, window manager, or Ghidra (unlike gui-smoke).
+    - name: Start VICE with the binary monitor
+      run: |
+        xvfb-run -a x64sc \
+          -binarymonitor -binarymonitoraddress 127.0.0.1:6502 \
+          -sounddev dummy \
+          -kernal  "$VICE_C64_ROM_DIR/kernal-901227-03.bin" \
+          -basic   "$VICE_C64_ROM_DIR/basic-901226-01.bin" \
+          -chargen "$VICE_C64_ROM_DIR/chargen-901225-01.bin" \
+          > "$RUNNER_TEMP/vice.log" 2>&1 &
+        for _ in $(seq 1 60); do
+          nc -z 127.0.0.1 6502 && exit 0
+          sleep 1
+        done
+        echo "VICE binary monitor port never opened" >&2
+        tail -40 "$RUNNER_TEMP/vice.log" >&2
+        exit 1
+
+    # REQUIRE_LIVE_VICE turns the live suite's not-reachable auto-skip into a failure:
+    # a VICE boot regression must not turn the suite into a silent no-op.
     - name: Run tests
+      env:
+        REQUIRE_LIVE_VICE: 1
       run: pytest
 
     - name: Install bats
@@ -128,33 +159,11 @@ jobs:
           xvfb xauth util-linux metacity xdotool netcat-openbsd imagemagick \
           unzip curl wget vice
 
-    # Ubuntu's `vice` package ships the emulator but NOT the copyrighted C64
-    # ROMs. Fetch the GPL-distributed ROMs from VICE upstream; run.sh passes them
-    # to x64sc. NB: VICE 3.7.1 logs "Couldn't load kernal ROM" for a byte-identical
-    # kernal but still injects and runs the PRG, so the smoke test gates on
-    # autostart success rather than kernal load (see run.sh vice_boot_ready).
+    # NB: VICE 3.7.1 logs "Couldn't load kernal ROM" for a byte-identical kernal
+    # but still injects and runs the PRG, so the smoke test gates on autostart
+    # success rather than kernal load (see run.sh vice_boot_ready).
     - name: Provision VICE C64 ROMs
-      run: |
-        ROM_DIR="$RUNNER_TEMP/vice-roms/C64"
-        mkdir -p "$ROM_DIR"
-        BASE=https://raw.githubusercontent.com/VICE-Team/svn-mirror/main/vice/data/C64
-        # rom:sha256 — pin exact bytes (subsumes the old size check) so an upstream
-        # change or a truncated/HTML download is caught before x64sc runs.
-        for spec in \
-          kernal-901227-03.bin:83c60d47047d7beab8e5b7bf6f67f80daa088b7a6a27de0d7e016f6484042721 \
-          basic-901226-01.bin:89878cea0a268734696de11c4bae593eaaa506465d2029d619c0e0cbccdfa62d \
-          chargen-901225-01.bin:fd0d53b8480e86163ac98998976c72cc58d5dd8eb824ed7b829774e74213b420
-        do
-          rom=${spec%%:*}
-          expected=${spec##*:}
-          curl -fsSL "$BASE/$rom" -o "$ROM_DIR/$rom"
-          actual=$(sha256sum "$ROM_DIR/$rom" | cut -d' ' -f1)
-          if [ "$actual" != "$expected" ]; then
-            echo "ROM sha256 mismatch: $rom expected $expected, got $actual" >&2
-            exit 1
-          fi
-        done
-        echo "VICE_C64_ROM_DIR=$ROM_DIR" >> "$GITHUB_ENV"
+      uses: ./.github/actions/provision-vice-roms
 
     - name: Find latest Ghidra 12.1 release
       env:

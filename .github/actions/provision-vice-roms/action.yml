@@ -1,0 +1,30 @@
+name: Provision VICE C64 ROMs
+description: >
+  Ubuntu's `vice` package ships the emulator but NOT the copyrighted C64 ROMs. Fetch the
+  GPL-distributed ROMs from VICE upstream and export VICE_C64_ROM_DIR for x64sc.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        ROM_DIR="$RUNNER_TEMP/vice-roms/C64"
+        mkdir -p "$ROM_DIR"
+        BASE=https://raw.githubusercontent.com/VICE-Team/svn-mirror/main/vice/data/C64
+        # rom:sha256 — pin exact bytes (subsumes the old size check) so an upstream
+        # change or a truncated/HTML download is caught before x64sc runs.
+        for spec in \
+          kernal-901227-03.bin:83c60d47047d7beab8e5b7bf6f67f80daa088b7a6a27de0d7e016f6484042721 \
+          basic-901226-01.bin:89878cea0a268734696de11c4bae593eaaa506465d2029d619c0e0cbccdfa62d \
+          chargen-901225-01.bin:fd0d53b8480e86163ac98998976c72cc58d5dd8eb824ed7b829774e74213b420
+        do
+          rom=${spec%%:*}
+          expected=${spec##*:}
+          curl -fsSL "$BASE/$rom" -o "$ROM_DIR/$rom"
+          actual=$(sha256sum "$ROM_DIR/$rom" | cut -d' ' -f1)
+          if [ "$actual" != "$expected" ]; then
+            echo "ROM sha256 mismatch: $rom expected $expected, got $actual" >&2
+            exit 1
+          fi
+        done
+        echo "VICE_C64_ROM_DIR=$ROM_DIR" >> "$GITHUB_ENV"

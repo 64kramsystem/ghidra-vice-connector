@@ -10,6 +10,7 @@ Uses a single module-scoped connection since VICE only allows one
 binary monitor client at a time.
 """
 
+import os
 import re
 import socket
 import struct
@@ -37,8 +38,16 @@ def _vice_reachable():
         return False
 
 
+_VICE_UP = _vice_reachable()
+
+# CI boots an emulator and sets REQUIRE_LIVE_VICE so a VICE boot failure fails the suite
+# instead of silently skipping it.
+if os.environ.get('REQUIRE_LIVE_VICE') and not _VICE_UP:
+    pytest.fail(f"REQUIRE_LIVE_VICE is set but VICE is not reachable on {VICE_HOST}:{VICE_PORT}",
+                pytrace=False)
+
 pytestmark = pytest.mark.skipif(
-    not _vice_reachable(),
+    not _VICE_UP,
     reason=f"VICE not reachable on {VICE_HOST}:{VICE_PORT}",
 )
 
