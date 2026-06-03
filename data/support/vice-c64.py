@@ -6,15 +6,16 @@ import os
 import sys
 
 # Set up logging FIRST so all modules get it
+log_file = os.environ.get('OPT_LOG_FILE', '/tmp/vice-agent.log')
+log_level = getattr(logging, os.environ.get('OPT_LOG_LEVEL', 'DEBUG'), logging.DEBUG)
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=log_level,
     format='%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s: %(message)s',
     datefmt='%H:%M:%S',
-    filename='/tmp/vice-agent.log',
+    filename=log_file,
     filemode='w',
 )
 log = logging.getLogger('vice-agent')
-log.setLevel(logging.DEBUG)
 
 log.info("=== VICE C64 TraceRmi agent starting ===")
 log.info(f"Python: {sys.executable} {sys.version}")
