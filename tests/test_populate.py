@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from vice import commands, arch
+from vice.util import Bank
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -21,6 +22,14 @@ def make_mock_vice(pc=0xC000):
     }
     vice.checkpoint_list.return_value = []
     vice.memory_get.return_value = b'\xEA' * 0x400  # NOP fill
+    vice.vice_info.return_value = '3.10.0'
+    vice.banks_available.return_value = [
+        Bank(id=0, name='default'),
+        Bank(id=0, name='cpu'),
+        Bank(id=1, name='ram'),
+    ]
+    vice.host = '127.0.0.1'
+    vice.port = 6502
     return vice
 
 
@@ -177,3 +186,53 @@ class TestOnStopBreakpointSync:
         with patch.object(commands, 'put_registers') as mock_put:
             commands.on_stop()
             mock_put.assert_called_once()
+
+
+# ── put_environment ──────────────────────────────────────────────────────────
+
+class TestPutEnvironment:
+    def setup_method(self):
+        commands.STATE.vice  = make_mock_vice()
+        commands.STATE.trace = make_mock_trace()
+        # Distinct mock per created path so attribute asserts do not bleed
+        # between the environment and bank objects.
+        self.objs = {}
+        def co(path):
+            self.objs.setdefault(path, MagicMock())
+            return self.objs[path]
+        commands.STATE.trace.create_object.side_effect = co
+
+    def test_environment_attributes(self):
+        commands.put_environment()
+        env = self.objs[commands.ENV_PATH]
+        vals = {c.args[0]: c.args[1] for c in env.set_value.call_args_list}
+        assert vals['_arch'] == '6502'
+        assert vals['_os'] == 'C64'
+        assert vals['_endian'] == 'little'
+        assert vals['_debugger'] == 'VICE 3.10.0'
+        assert vals['_display'] == 'VICE 3.10.0 @ 127.0.0.1:6502'
+        env.insert.assert_called_once()
+
+    def test_banks_keyed_by_name(self):
+        """VICE reuses bank ids (0 is both 'default' and 'cpu'), so objects are
+        keyed by name — all banks must survive."""
+        commands.put_environment()
+        assert commands.BANKS_PATH in self.objs
+        bank_paths = {p for p in self.objs if p.startswith('C64.Environment.Banks[')}
+        assert bank_paths == {
+            'C64.Environment.Banks[default]',
+            'C64.Environment.Banks[cpu]',
+            'C64.Environment.Banks[ram]',
+        }
+
+    def test_bank_attributes(self):
+        commands.put_environment()
+        cpu = self.objs['C64.Environment.Banks[cpu]']
+        vals = {c.args[0]: c.args[1] for c in cpu.set_value.call_args_list}
+        assert vals['id'] == 0
+        assert 'cpu' in vals['_display']
+
+    def test_initial_populate_includes_environment(self):
+        commands.STATE.client = MagicMock()
+        commands.populate_initial_state()
+        assert commands.ENV_PATH in self.objs
