@@ -4,6 +4,7 @@ ViceBmpClient integration tests using MockViceServer.
 All tests exercise real TCP sockets so they catch actual wire-format bugs.
 """
 
+import logging
 import struct
 import threading
 import time
@@ -22,10 +23,10 @@ from vice.util import (
     CMD_PING, CMD_EXIT,
     RESP_MEMORY_GET, RESP_CHECKPOINT_INFO, RESP_CHECKPOINT_LIST,
     RESP_REGISTERS_GET, RESP_BANKS_AVAILABLE, RESP_VICE_INFO,
-    RESP_STOPPED, RESP_RESUMED,
+    RESP_STOPPED, RESP_RESUMED, RESP_PING,
     CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE,
     MEMSPACE_MAIN,
-    ViceBmpClient, ViceError,
+    ViceBmpClient, ViceError, ViceProtocolError,
     EVENT_REQUEST_ID,
 )
 from bmp_helpers import (
@@ -150,7 +151,7 @@ class TestRegistersSet:
             value = struct.unpack_from('<H', body, 5)[0]
             received['reg_id'] = reg_id
             received['value'] = value
-            return (CMD_REGISTERS_SET, b'')
+            return (RESP_REGISTERS_GET, b'')
 
         server.handle(CMD_REGISTERS_SET, handler)
         client.registers_set({'PC': 0xC000})
@@ -167,7 +168,7 @@ class TestRegistersSet:
         def handler(body):
             count = struct.unpack_from('<H', body, 1)[0]
             received_count['n'] = count
-            return (CMD_REGISTERS_SET, b'')
+            return (RESP_REGISTERS_GET, b'')
 
         server.handle(CMD_REGISTERS_SET, handler)
         client.registers_set({'PC': 0x1000, 'A': 0x42})
@@ -465,10 +466,10 @@ class TestCheckpointList:
         server.handle(CMD_CHECKPOINT_LIST, lambda _: self._make_frames(cps))
         result = client.checkpoint_list()
         assert len(result) == 1
-        assert result[0]['number'] == 1
-        assert result[0]['start']  == 0xC000
-        assert result[0]['cpu_op'] == CPU_OP_EXEC
-        assert result[0]['hit_count'] == 2
+        assert result[0].number == 1
+        assert result[0].start  == 0xC000
+        assert result[0].cpu_op == CPU_OP_EXEC
+        assert result[0].hit_count == 2
 
     def test_multiple_checkpoints(self, connected_client):
         client, server = connected_client
@@ -480,8 +481,8 @@ class TestCheckpointList:
         server.handle(CMD_CHECKPOINT_LIST, lambda _: self._make_frames(cps))
         result = client.checkpoint_list()
         assert len(result) == 3
-        assert result[1]['start'] == 0xD020
-        assert result[2]['end']   == 0x07FF
+        assert result[1].start == 0xD020
+        assert result[2].end   == 0x07FF
 
     def test_enabled_disabled_flags(self, connected_client):
         client, server = connected_client
@@ -491,8 +492,8 @@ class TestCheckpointList:
         ]
         server.handle(CMD_CHECKPOINT_LIST, lambda _: self._make_frames(cps))
         result = client.checkpoint_list()
-        assert result[0]['enabled'] is True
-        assert result[1]['enabled'] is False
+        assert result[0].enabled is True
+        assert result[1].enabled is False
 
     def test_info_frames_ordering_preserved(self, connected_client):
         client, server = connected_client
@@ -502,8 +503,8 @@ class TestCheckpointList:
         ]
         server.handle(CMD_CHECKPOINT_LIST, lambda _: self._make_frames(cps))
         result = client.checkpoint_list()
-        assert result[0]['number'] == 5
-        assert result[1]['number'] == 1
+        assert result[0].number == 5
+        assert result[1].number == 1
 
 
 # ── step ───────────────────────────────────────────────────────────────────────
@@ -635,30 +636,21 @@ class TestReset:
 # ── vice_info ──────────────────────────────────────────────────────────────────
 
 class TestViceInfo:
-    def test_legacy_text_format(self, connected_client):
-        """Legacy: ML(1) version_string(ML bytes)"""
-        client, server = connected_client
-        # ML=10, version='VICE 3.7.1'
-        server.handle(CMD_VICE_INFO,
-                      lambda _: (RESP_VICE_INFO, b'\x0aVICE 3.7.1'))
-        result = client.vice_info()
-        assert result == 'VICE 3.7.1'
+    """Wire format (unchanged since the command was introduced):
+    verlen(1)=4 major(1) minor(1) patch(1) rc(1) svnlen(1)=4 svn(4)
+    """
 
-    def test_binary_format(self, connected_client):
-        """Modern VICE 3.x+: major(1) minor(1) patch(1)"""
+    def test_parses_version(self, connected_client):
         client, server = connected_client
-        # 3.7.1 as binary: \x03\x07\x01
-        server.handle(CMD_VICE_INFO,
-                      lambda _: (RESP_VICE_INFO, bytes([3, 7, 1])))
-        result = client.vice_info()
-        assert result == '3.7.1'
+        body = bytes([4, 3, 10, 0, 0, 4, 0, 0, 0, 0])
+        server.handle(CMD_VICE_INFO, lambda _: (RESP_VICE_INFO, body))
+        assert client.vice_info() == '3.10.0'
 
-    def test_strips_null_terminator(self, connected_client):
+    def test_parses_nonzero_patch(self, connected_client):
         client, server = connected_client
-        server.handle(CMD_VICE_INFO,
-                      lambda _: (RESP_VICE_INFO, b'\x08VICE 3.7'))
-        result = client.vice_info()
-        assert not result.endswith('\x00')
+        body = bytes([4, 3, 7, 1, 0, 4, 0x12, 0x34, 0, 0])
+        server.handle(CMD_VICE_INFO, lambda _: (RESP_VICE_INFO, body))
+        assert client.vice_info() == '3.7.1'
 
 
 # ── banks_available ────────────────────────────────────────────────────────────
@@ -680,8 +672,8 @@ class TestBanksAvailable:
                                  self._make_banks_body([(0, 'ram'), (1, 'rom')])))
         result = client.banks_available()
         assert len(result) == 2
-        assert result[0]['name'] == 'ram'
-        assert result[1]['name'] == 'rom'
+        assert result[0].name == 'ram'
+        assert result[1].name == 'rom'
 
     def test_empty_banks(self, connected_client):
         client, server = connected_client
@@ -971,3 +963,74 @@ class TestInterrupt:
         client.interrupt()
         elapsed = time.monotonic() - start
         assert elapsed < 0.5, f"interrupt() blocked for {elapsed:.2f}s"
+
+
+# ── protocol hardening ─────────────────────────────────────────────────────────
+
+class TestResponseTypeValidation:
+    def test_unexpected_response_type_raises(self, connected_client):
+        client, server = connected_client
+        server.handle(CMD_MEMORY_GET, lambda _: (RESP_VICE_INFO, b''))
+        with pytest.raises(ViceProtocolError) as ei:
+            client.memory_get(0x0000, 0x0001)
+        assert ei.value.cmd == CMD_MEMORY_GET
+        assert ei.value.expected == RESP_MEMORY_GET
+        assert ei.value.actual == RESP_VICE_INFO
+
+    def test_error_code_takes_precedence_over_type_mismatch(self, connected_client):
+        """An unhandled command gets resp_type == cmd (wrong for registers_set) AND
+        error 0x8F from the mock; the error must win over the type mismatch."""
+        client, server = connected_client
+        with pytest.raises(ViceError):
+            client.registers_set({'PC': 0x1000})
+
+
+class TestViceErrorDetails:
+    def test_carries_command_and_request_id(self, connected_client):
+        client, server = connected_client
+        with pytest.raises(ViceError) as ei:
+            client.reset(0)  # no handler installed -> mock replies error 0x8F
+        assert ei.value.code == 0x8F
+        assert ei.value.cmd == CMD_RESET
+        assert ei.value.request_id is not None
+        assert '0x8F' in str(ei.value)
+
+
+class TestHeaderValidation:
+    def _wait_stopped(self, client, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not client._running:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_corrupt_stx_stops_client(self, connected_client):
+        client, server = connected_client
+        bad = struct.pack(RESP_HDR_FMT, 0x55, API_VERSION, 0, RESP_PING, 0x00, 12345)
+        server.send_raw(bad)
+        assert self._wait_stopped(client), "client kept running on corrupt STX"
+
+    def test_wrong_api_version_stops_client(self, connected_client):
+        client, server = connected_client
+        bad = struct.pack(RESP_HDR_FMT, STX, 0x7F, 0, RESP_PING, 0x00, 12345)
+        server.send_raw(bad)
+        assert self._wait_stopped(client), "client kept running on wrong API version"
+
+
+class TestOrphanErrorLogging:
+    def test_orphan_error_response_is_logged(self, connected_client, caplog):
+        """Fire-and-forget rejections (orphan responses with error != 0) must not
+        vanish silently."""
+        client, server = connected_client
+        frame = struct.pack(RESP_HDR_FMT, STX, API_VERSION, 0,
+                            CMD_ADVANCE_INSTRUCTIONS, 0x8F, 99999)
+        with caplog.at_level(logging.ERROR, logger='vice-agent'):
+            server.send_raw(frame)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if any('0x8F' in r.message for r in caplog.records):
+                    break
+                time.sleep(0.02)
+        assert any('0x8F' in r.message and 'ORPHAN' in r.message.upper()
+                   for r in caplog.records), "orphan error response was not logged"

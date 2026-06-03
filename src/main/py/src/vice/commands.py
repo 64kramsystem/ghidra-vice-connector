@@ -333,23 +333,23 @@ def put_breakpoints():
     log.debug(f"put_breakpoints(): {len(checkpoints)} checkpoints")
 
     # Retain only the current checkpoint keys — removes stale breakpoint objects
-    keys = [f'[{cp["number"]}]' for cp in checkpoints]
+    keys = [f'[{cp.number}]' for cp in checkpoints]
     bps = t.create_object(BPS_PATH)
     bps.retain_values(keys, kinds='elements')
 
     for cp in checkpoints:
-        path = BP_PATH.format(n=cp['number'])
+        path = BP_PATH.format(n=cp.number)
         obj = t.create_object(path)
-        kinds = _cpu_op_to_kinds(cp['cpu_op'])
+        kinds = _cpu_op_to_kinds(cp.cpu_op)
         obj.set_value('_display',
-                      f"[{cp['number']}] 0x{cp['start']:04X} {kinds} "
-                      f"{'EN' if cp['enabled'] else 'DIS'}")
+                      f"[{cp.number}] 0x{cp.start:04X} {kinds} "
+                      f"{'EN' if cp.enabled else 'DIS'}")
         obj.set_value('_range',
                       AddressRange.extend(
-                          Address('RAM', cp['start']),
-                          cp['end'] - cp['start'] + 1,
+                          Address('RAM', cp.start),
+                          cp.end - cp.start + 1,
                       ))
-        obj.set_value('_enabled', cp['enabled'])
+        obj.set_value('_enabled', cp.enabled)
         obj.set_value('_kinds',   kinds)
         obj.insert()
 
