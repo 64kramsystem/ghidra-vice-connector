@@ -45,6 +45,9 @@ MEM_PATH     = 'C64.Memory'
 MEM_REGION_PATH = 'C64.Memory[{key}]'
 BPS_PATH     = 'C64.Breakpoints'
 BP_PATH      = 'C64.Breakpoints[{n}]'
+ENV_PATH     = 'C64.Environment'
+BANKS_PATH   = 'C64.Environment.Banks'
+BANK_PATH    = 'C64.Environment.Banks[{name}]'
 
 # ── Shared agent state ────────────────────────────────────────────────────────
 # Follows the GDB/Frida agent pattern: require_*() enforces preconditions,
@@ -147,6 +150,8 @@ def populate_initial_state():
                 trace.snapshot('Initial snapshot')
                 log.debug("populate_initial_state(): skeleton")
                 _create_object_skeleton()
+                log.debug("populate_initial_state(): environment")
+                put_environment()
                 log.debug("populate_initial_state(): memory regions")
                 put_memory_regions()
                 log.debug("populate_initial_state(): registers")
@@ -276,6 +281,35 @@ def put_registers():
     log.debug("put_registers() complete")
 
 
+# ── Environment population ────────────────────────────────────────────────────
+
+def put_environment():
+    """Populate the Environment node: VICE version, connection, memory banks."""
+    t = STATE.trace
+    vice = STATE.require_vice()
+    version = vice.vice_info()
+
+    env = t.create_object(ENV_PATH)
+    env.set_value('_arch', '6502')
+    env.set_value('_os', 'C64')
+    env.set_value('_endian', 'little')
+    env.set_value('_debugger', f'VICE {version}')
+    env.set_value('_display', f'VICE {version} @ {vice.host}:{vice.port}')
+    env.insert()
+
+    banks = t.create_object(BANKS_PATH)
+    banks.insert()
+    # Banks are static per machine; memory reads always use bank 0 (the default bank),
+    # so this is informational metadata. Keyed by name: VICE reuses ids (0 is both
+    # 'default' and 'cpu').
+    for bank in vice.banks_available():
+        obj = t.create_object(BANK_PATH.format(name=bank.name))
+        obj.set_value('_display', f'{bank.name} (id {bank.id})')
+        obj.set_value('id', bank.id)
+        obj.insert()
+    log.debug("put_environment() complete")
+
+
 # ── Memory region population ──────────────────────────────────────────────────
 
 def put_memory_regions():
@@ -333,23 +367,23 @@ def put_breakpoints():
     log.debug(f"put_breakpoints(): {len(checkpoints)} checkpoints")
 
     # Retain only the current checkpoint keys — removes stale breakpoint objects
-    keys = [f'[{cp["number"]}]' for cp in checkpoints]
+    keys = [f'[{cp.number}]' for cp in checkpoints]
     bps = t.create_object(BPS_PATH)
     bps.retain_values(keys, kinds='elements')
 
     for cp in checkpoints:
-        path = BP_PATH.format(n=cp['number'])
+        path = BP_PATH.format(n=cp.number)
         obj = t.create_object(path)
-        kinds = _cpu_op_to_kinds(cp['cpu_op'])
+        kinds = _cpu_op_to_kinds(cp.cpu_op)
         obj.set_value('_display',
-                      f"[{cp['number']}] 0x{cp['start']:04X} {kinds} "
-                      f"{'EN' if cp['enabled'] else 'DIS'}")
+                      f"[{cp.number}] 0x{cp.start:04X} {kinds} "
+                      f"{'EN' if cp.enabled else 'DIS'}")
         obj.set_value('_range',
                       AddressRange.extend(
-                          Address('RAM', cp['start']),
-                          cp['end'] - cp['start'] + 1,
+                          Address('RAM', cp.start),
+                          cp.end - cp.start + 1,
                       ))
-        obj.set_value('_enabled', cp['enabled'])
+        obj.set_value('_enabled', cp.enabled)
         obj.set_value('_kinds',   kinds)
         obj.insert()
 

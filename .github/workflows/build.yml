@@ -91,6 +91,12 @@ jobs:
     - name: Run tests
       run: pytest
 
+    - name: Install bats
+      run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats
+
+    - name: Run shell tests
+      run: bats test/import-prg.bats
+
   # GUI smoke test: install the *packaged* extension into a real Ghidra 12.1
   # GUI under Xvfb and a running VICE binary monitor. run.sh GATES on the
   # deterministic parts (extension installs and is accepted by Ghidra 12.1,

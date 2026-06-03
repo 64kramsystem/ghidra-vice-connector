@@ -54,19 +54,11 @@ def _on_resumed(resp_type: int, error: int, body: bytes):
 
     Body: PC (2 LE)
 
-    For step commands, VICE sends RESUMED then immediately STOPPED.
-    We skip on_resume() if a STOPPED event is already queued, avoiding
-    the expensive RUNNING->STOPPED state transition that triggers Ghidra
-    refresh callbacks.
+    For steps, VICE sends RESUMED immediately followed by STOPPED; the event
+    worker coalesces that pair, so reaching this handler means a real resume.
     """
     pc = struct.unpack_from('<H', body, 0)[0] if len(body) >= 2 else 0
     log.info(f"EVENT resumed: PC=0x{pc:04X}")
-    # Check if a STOPPED event is already queued — if so, this is a step
-    # and we can skip the expensive on_resume() state change.
-    vice = commands.STATE.vice
-    if vice is not None and vice.has_pending_events():
-        log.info("resumed: STOPPED already queued (step), skipping on_resume()")
-        return
     commands.on_resume()
 
 

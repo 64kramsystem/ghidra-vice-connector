@@ -10,6 +10,7 @@ Uses a single module-scoped connection since VICE only allows one
 binary monitor client at a time.
 """
 
+import re
 import socket
 import struct
 import threading
@@ -66,14 +67,13 @@ class TestLiveConnection:
 
     def test_vice_info_returns_version_string(self, vice):
         info = vice.vice_info()
-        assert isinstance(info, str)
-        assert len(info) > 0
+        assert re.fullmatch(r'\d+\.\d+\.\d+', info)
 
     def test_banks_available_returns_list(self, vice):
         banks = vice.banks_available()
         assert isinstance(banks, list)
         assert len(banks) > 0
-        names = [b['name'] for b in banks]
+        names = [b.name for b in banks]
         assert any(n in names for n in ('default', 'cpu', 'ram')), \
             f"No expected bank name in {names}"
 
@@ -178,11 +178,11 @@ class TestLiveCheckpoints:
         assert isinstance(cp_num, int)
         assert cp_num > 0
         cps = vice.checkpoint_list()
-        numbers = [cp['number'] for cp in cps]
+        numbers = [cp.number for cp in cps]
         assert cp_num in numbers
         vice.checkpoint_delete(cp_num)
         cps = vice.checkpoint_list()
-        numbers = [cp['number'] for cp in cps]
+        numbers = [cp.number for cp in cps]
         assert cp_num not in numbers
 
     def test_checkpoint_toggle(self, vice):
@@ -190,12 +190,12 @@ class TestLiveCheckpoints:
         try:
             vice.checkpoint_toggle(cp_num, False)
             cps = vice.checkpoint_list()
-            cp = next(c for c in cps if c['number'] == cp_num)
-            assert cp['enabled'] is False
+            cp = next(c for c in cps if c.number == cp_num)
+            assert cp.enabled is False
             vice.checkpoint_toggle(cp_num, True)
             cps = vice.checkpoint_list()
-            cp = next(c for c in cps if c['number'] == cp_num)
-            assert cp['enabled'] is True
+            cp = next(c for c in cps if c.number == cp_num)
+            assert cp.enabled is True
         finally:
             vice.checkpoint_delete(cp_num)
 
@@ -208,12 +208,12 @@ class TestLiveCheckpoints:
         )
         try:
             cps = vice.checkpoint_list()
-            cp = next(c for c in cps if c['number'] == cp_num)
-            assert cp['start'] == 0xA000
-            assert cp['end'] == 0xA0FF
-            assert cp['cpu_op'] == CPU_OP_LOAD
-            assert cp['enabled'] is True
-            assert cp['stop_on_hit'] is True
+            cp = next(c for c in cps if c.number == cp_num)
+            assert cp.start == 0xA000
+            assert cp.end == 0xA0FF
+            assert cp.cpu_op == CPU_OP_LOAD
+            assert cp.enabled is True
+            assert cp.stop_on_hit is True
         finally:
             vice.checkpoint_delete(cp_num)
 
@@ -221,8 +221,8 @@ class TestLiveCheckpoints:
         cp_num = vice.checkpoint_set(0x0400, 0x0400, cpu_op=CPU_OP_STORE)
         try:
             cps = vice.checkpoint_list()
-            cp = next(c for c in cps if c['number'] == cp_num)
-            assert cp['cpu_op'] == CPU_OP_STORE
+            cp = next(c for c in cps if c.number == cp_num)
+            assert cp.cpu_op == CPU_OP_STORE
         finally:
             vice.checkpoint_delete(cp_num)
 
@@ -237,7 +237,7 @@ class TestLiveCheckpoints:
                 n = vice.checkpoint_set(addr, addr, cpu_op=CPU_OP_EXEC)
                 nums.append(n)
             cps = vice.checkpoint_list()
-            listed = {cp['number'] for cp in cps}
+            listed = {cp.number for cp in cps}
             for n in nums:
                 assert n in listed
         finally:

@@ -39,16 +39,20 @@ Install the built extension zip through **File > Install Extensions** in Ghidra,
 1. Start VICE with the binary monitor enabled:
 
    ```sh
-   x64sc -binarymonitor -binarymonitoraddress localhost:6502
+   x64sc -binarymonitor -binarymonitoraddress 127.0.0.1:6502
    ```
 
 2. In Ghidra, open the **Debugger** tool.
 
 3. From the debugger launch menu, select **VICE C64 Debugger**.
 
-4. Configure the host and port (default: `localhost:6502`) and click **Launch**.
+4. Configure the host and port (default: `127.0.0.1:6502`) and click **Launch**.
 
 The connector will attach to VICE, read the current CPU state, and populate the trace. You can then use Ghidra's standard debugger controls (step, resume, breakpoints, memory view, etc.).
+
+## Security
+
+The VICE binary monitor is an unauthenticated TCP control channel over the emulator (memory, registers, execution). Keep it bound to `127.0.0.1`; for remote debugging, reach it through SSH port forwarding rather than binding it to a network interface.
 
 ## Project Structure
 
@@ -82,21 +86,9 @@ rm -rf $HOME/.config/ghidra/$GHIDRA_VER/Extensions/ghidra-vice-connector
 unzip -q dist/$GHIDRA_VER_*_ghidra-vice-connector.zip -d $HOME/.config/ghidra/$GHIDRA_VER/Extensions/
 
 # Once: prepare test program and Ghidra project
+# (imports at the load address from the PRG header — no manual stripping/rebasing)
 
-python3 -c "
-import pathlib
-prg = pathlib.Path('data/test.prg').read_bytes()
-pathlib.Path('data/test_raw.bin').write_bytes(prg[2:])
-"
-$GHIDRA_PATH/support/analyzeHeadless \
-  data/ghidra-project ViceTest \
-  -import data/test_raw.bin \
-  -processor "6502:LE:16:default" \
-  -cspec default \
-  -loader BinaryLoader \
-  -postScript RebaseToC64Load.java \
-  -scriptPath data/ghidra-scripts \
-  -overwrite
+GHIDRA_HOME=$GHIDRA_PATH data/support/import-prg.sh data/test.prg data/ghidra-project ViceTest
 
 # Prepare and open the project
 #
