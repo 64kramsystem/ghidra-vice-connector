@@ -21,6 +21,8 @@ jobs:
   # targets Java 21, and the Gradle 9.2.1 wrapper does not run under newer JDKs.
   build:
     runs-on: ubuntu-latest
+    outputs:
+      ghidra-version: ${{ steps.ghidra.outputs.version }}
 
     steps:
     - uses: actions/checkout@v6
@@ -33,6 +35,7 @@ jobs:
         cache: gradle
 
     - name: Find latest Ghidra 12.1 release
+      id: ghidra
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
@@ -44,7 +47,10 @@ jobs:
         # Extract dir name: ghidra_12.1_PUBLIC (strip date suffix and .zip)
         GHIDRA_DIR=$(basename "$GHIDRA_URL" .zip | sed 's/_[0-9]*$//')
         echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
-        echo "Resolved Ghidra release: $GHIDRA_DIR"
+        # Extract version: ghidra_12.1_PUBLIC -> 12.1
+        GHIDRA_VERSION=$(echo "$GHIDRA_DIR" | sed 's/ghidra_\(.*\)_PUBLIC/\1/')
+        echo "version=$GHIDRA_VERSION" >> "$GITHUB_OUTPUT"
+        echo "Resolved Ghidra release: $GHIDRA_DIR (version $GHIDRA_VERSION)"
 
     - name: Download Ghidra
       run: |
@@ -84,3 +90,56 @@ jobs:
 
     - name: Run tests
       run: pytest
+
+  # Version-matched release on push to master / manual dispatch. Consumes the
+  # Ghidra version resolved by `build` (via job outputs) so a new Ghidra release
+  # landing mid-run cannot mislabel the artifact.
+  release:
+    needs: [build, python-tests]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        # Full history so the push range below resolves even for multi-commit
+        # pushes (a shallow clone would not contain github.event.before).
+        fetch-depth: 0
+
+    - name: Download packaged extension artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: ghidra-vice-connector
+        path: dist
+
+    - name: Check if release-worthy files changed
+      id: changes
+      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+      env:
+        BEFORE: ${{ github.event.before }}
+        AFTER: ${{ github.sha }}
+      run: |
+        # Diff the whole push range, not just the tip commit: a multi-commit
+        # push can change release-worthy files in an earlier commit.
+        ZERO=0000000000000000000000000000000000000000
+        if [ -z "$BEFORE" ] || [ "$BEFORE" = "$ZERO" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          # First push of the branch / unknown base — release unconditionally.
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" -- \
+          src/ data/ build.gradle extension.properties)
+        if [ -n "$CHANGED" ]; then
+          echo "release=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Create release
+      if: steps.changes.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
+      env:
+        GHIDRA_VERSION: ${{ needs.build.outputs.ghidra-version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="v${GHIDRA_VERSION}-$(date -u +%Y%m%d%H%M%S)"
+        gh release create "$TAG" dist/*.zip \
+          --title "VICE C64 Connector for Ghidra $GHIDRA_VERSION" \
+          --notes "Built against Ghidra $GHIDRA_VERSION"
