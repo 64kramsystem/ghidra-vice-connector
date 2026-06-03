@@ -1,0 +1,256 @@
+name: Build
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same ref (PR/branch).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build the Ghidra extension against the latest Ghidra 12.1 release.
+  #
+  # The build is version-agnostic (build.gradle applies the Ghidra install's own
+  # support/buildExtension.gradle), so CI just needs the full Ghidra install on
+  # disk and GHIDRA_INSTALL_DIR pointing at it. JDK 21 is required: Ghidra 12.1
+  # targets Java 21, and the Gradle 9.2.1 wrapper does not run under newer JDKs.
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      ghidra-version: ${{ steps.ghidra.outputs.version }}
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v5
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+        cache: gradle
+
+    - name: Find latest Ghidra 12.1 release
+      id: ghidra
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        GHIDRA_URL=$(gh api repos/NationalSecurityAgency/ghidra/releases \
+          --jq '[.[] | select(.tag_name | test("^Ghidra_12\\.1(?:\\.[0-9]+)?_build$"))][0].assets
+            | map(select(.name | test("^ghidra_12\\.1(?:\\.[0-9]+)?_PUBLIC_[0-9]+\\.zip$")))
+            | .[0].browser_download_url')
+        echo "GHIDRA_URL=$GHIDRA_URL" >> "$GITHUB_ENV"
+        # Extract dir name: ghidra_12.1_PUBLIC (strip date suffix and .zip)
+        GHIDRA_DIR=$(basename "$GHIDRA_URL" .zip | sed 's/_[0-9]*$//')
+        echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
+        # Extract version: ghidra_12.1_PUBLIC -> 12.1
+        GHIDRA_VERSION=$(echo "$GHIDRA_DIR" | sed 's/ghidra_\(.*\)_PUBLIC/\1/')
+        echo "version=$GHIDRA_VERSION" >> "$GITHUB_OUTPUT"
+        echo "Resolved Ghidra release: $GHIDRA_DIR (version $GHIDRA_VERSION)"
+
+    - name: Download Ghidra
+      run: |
+        # Extract OUTSIDE the checkout: Ghidra's buildExtension zips the project
+        # root, so an in-tree Ghidra install (~1 GB) would be bundled into the
+        # extension artifact. $RUNNER_TEMP keeps it off the packaged tree.
+        wget --no-verbose -O "$RUNNER_TEMP/ghidra.zip" "$GHIDRA_URL"
+        7z x -bd -o"$RUNNER_TEMP" "$RUNNER_TEMP/ghidra.zip"
+        echo "GHIDRA_INSTALL_DIR=$RUNNER_TEMP/$GHIDRA_DIR" >> "$GITHUB_ENV"
+
+    - name: Build extension
+      run: ./gradlew --no-daemon clean buildExtension
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: ghidra-vice-connector
+        path: dist/*.zip
+        if-no-files-found: error
+
+  # Unit/integration tests for the Python TraceRmi agent. conftest.py stubs the
+  # ghidratrace modules, so no Ghidra install is needed; the live-VICE suite
+  # auto-skips when no emulator is reachable. Runs in parallel with build.
+  python-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+
+    - name: Install pytest
+      run: pip install pytest
+
+    - name: Run tests
+      run: pytest
+
+  # GUI smoke test: install the *packaged* extension into a real Ghidra 12.1
+  # GUI under Xvfb and a running VICE binary monitor. run.sh GATES on the
+  # deterministic parts (extension installs and is accepted by Ghidra 12.1,
+  # fixture imports, VICE monitor opens) and PROBES the end-to-end debugger
+  # launch best-effort (warns, does not fail).
+  #
+  # continue-on-error: the xdotool driving of Ghidra's launch dialog is
+  # timing-/UI-revision-sensitive and is not yet confirmed on a runner; the job
+  # is informational (never fails the workflow, not a release dependency) and
+  # also tolerates environment gaps such as VICE ROM availability.
+  gui-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.x'
+
+    - name: Install GUI + emulator dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          xvfb xauth util-linux metacity xdotool netcat-openbsd imagemagick \
+          unzip curl wget vice
+
+    # Ubuntu's `vice` package ships the emulator but NOT the copyrighted C64
+    # ROMs. Fetch the GPL-distributed ROMs from VICE upstream; run.sh passes them
+    # to x64sc. NB: VICE 3.7.1 logs "Couldn't load kernal ROM" for a byte-identical
+    # kernal but still injects and runs the PRG, so the smoke test gates on
+    # autostart success rather than kernal load (see run.sh vice_boot_ready).
+    - name: Provision VICE C64 ROMs
+      run: |
+        ROM_DIR="$RUNNER_TEMP/vice-roms/C64"
+        mkdir -p "$ROM_DIR"
+        BASE=https://raw.githubusercontent.com/VICE-Team/svn-mirror/main/vice/data/C64
+        # rom:sha256 — pin exact bytes (subsumes the old size check) so an upstream
+        # change or a truncated/HTML download is caught before x64sc runs.
+        for spec in \
+          kernal-901227-03.bin:83c60d47047d7beab8e5b7bf6f67f80daa088b7a6a27de0d7e016f6484042721 \
+          basic-901226-01.bin:89878cea0a268734696de11c4bae593eaaa506465d2029d619c0e0cbccdfa62d \
+          chargen-901225-01.bin:fd0d53b8480e86163ac98998976c72cc58d5dd8eb824ed7b829774e74213b420
+        do
+          rom=${spec%%:*}
+          expected=${spec##*:}
+          curl -fsSL "$BASE/$rom" -o "$ROM_DIR/$rom"
+          actual=$(sha256sum "$ROM_DIR/$rom" | cut -d' ' -f1)
+          if [ "$actual" != "$expected" ]; then
+            echo "ROM sha256 mismatch: $rom expected $expected, got $actual" >&2
+            exit 1
+          fi
+        done
+        echo "VICE_C64_ROM_DIR=$ROM_DIR" >> "$GITHUB_ENV"
+
+    - name: Find latest Ghidra 12.1 release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        GHIDRA_URL=$(gh api repos/NationalSecurityAgency/ghidra/releases \
+          --jq '[.[] | select(.tag_name | test("^Ghidra_12\\.1(?:\\.[0-9]+)?_build$"))][0].assets
+            | map(select(.name | test("^ghidra_12\\.1(?:\\.[0-9]+)?_PUBLIC_[0-9]+\\.zip$")))
+            | .[0].browser_download_url')
+        echo "GHIDRA_URL=$GHIDRA_URL" >> "$GITHUB_ENV"
+        GHIDRA_DIR=$(basename "$GHIDRA_URL" .zip | sed 's/_[0-9]*$//')
+        echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
+        echo "Resolved Ghidra release: $GHIDRA_DIR"
+
+    - name: Download Ghidra
+      run: |
+        # Keep the install out of the checkout (parity with the build job).
+        wget --no-verbose -O "$RUNNER_TEMP/ghidra.zip" "$GHIDRA_URL"
+        7z x -bd -o"$RUNNER_TEMP" "$RUNNER_TEMP/ghidra.zip"
+        echo "GHIDRA_HOME=$RUNNER_TEMP/$GHIDRA_DIR" >> "$GITHUB_ENV"
+
+    - name: Install ghidratrace from the Ghidra distribution
+      run: |
+        pip install "$GHIDRA_HOME"/Ghidra/Debug/Debugger-rmi-trace/pypkg/
+
+    - name: Download packaged extension artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: ghidra-vice-connector
+        path: dist
+
+    - name: Run GUI smoke test
+      run: |
+        EXT_ZIP=$(ls -t dist/*.zip | head -1)
+        echo "Extension ZIP: $EXT_ZIP"
+        bash test/gui-smoke/run.sh "$EXT_ZIP"
+
+    # Always upload: run.sh captures step screenshots + logs into this dir even
+    # on the green-but-probe-warned path, which is exactly what is needed to
+    # tune the launch automation.
+    - name: Upload GUI smoke diagnostics
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: gui-smoke-diagnostics
+        path: ${{ runner.temp }}/gui-smoke-artifacts/**
+        if-no-files-found: ignore
+
+  # Version-matched release on push to master / manual dispatch. Consumes the
+  # Ghidra version resolved by `build` (via job outputs) so a new Ghidra release
+  # landing mid-run cannot mislabel the artifact. gui-smoke is intentionally not
+  # a dependency: it is informational, not a release gate.
+  release:
+    needs: [build, python-tests]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # The default GITHUB_TOKEN is read-only; creating a release (and its tag)
+    # requires contents write.
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        # Full history so the push range below resolves even for multi-commit
+        # pushes (a shallow clone would not contain github.event.before).
+        fetch-depth: 0
+
+    - name: Download packaged extension artifact
+      uses: actions/download-artifact@v8
+      with:
+        name: ghidra-vice-connector
+        path: dist
+
+    - name: Check if release-worthy files changed
+      id: changes
+      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+      env:
+        BEFORE: ${{ github.event.before }}
+        AFTER: ${{ github.sha }}
+      run: |
+        # Diff the whole push range, not just the tip commit: a multi-commit
+        # push can change release-worthy files in an earlier commit.
+        ZERO=0000000000000000000000000000000000000000
+        if [ -z "$BEFORE" ] || [ "$BEFORE" = "$ZERO" ] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+          # First push of the branch / unknown base — release unconditionally.
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        CHANGED=$(git diff --name-only "$BEFORE" "$AFTER" -- \
+          src/ data/ build.gradle extension.properties)
+        if [ -n "$CHANGED" ]; then
+          echo "release=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Create release
+      if: steps.changes.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
+      env:
+        GHIDRA_VERSION: ${{ needs.build.outputs.ghidra-version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="v${GHIDRA_VERSION}-$(date -u +%Y%m%d%H%M%S)"
+        gh release create "$TAG" dist/*.zip \
+          --title "VICE C64 Connector for Ghidra $GHIDRA_VERSION" \
+          --notes "Built against Ghidra $GHIDRA_VERSION"
