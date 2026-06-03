@@ -231,10 +231,6 @@ class ViceBmpClient:
                 pass
         self._sock = None
 
-    def has_pending_events(self) -> bool:
-        """Return True if there are unprocessed events in the queue."""
-        return not self._event_queue.empty()
-
     def on_event(self, resp_type: int, handler: Callable):
         """Register a callback for unsolicited VICE events (stop/resume/etc.)."""
         log.debug(f"ViceBmpClient.on_event(): registering handler for 0x{resp_type:02X}: {handler}")
@@ -318,20 +314,35 @@ class ViceBmpClient:
         This keeps the recv loop free to read socket data and deliver
         responses to pending _command() calls, avoiding deadlocks when
         event handlers themselves call _command().
+
+        Events are dispatched in batches: the first event blocks, anything
+        already queued is drained behind it. Within a batch, a RESUMED with a
+        later STOPPED is dropped — VICE emits that pair for every step, and the
+        transient RUNNING transition triggers expensive Ghidra refreshes.
+        STOPPED events are never dropped: each one is a trace-history record.
         """
         log.debug("_event_worker: started")
         while self._running:
             try:
-                item = self._event_queue.get(timeout=1.0)
+                batch = [self._event_queue.get(timeout=1.0)]
             except queue.Empty:
                 continue
-            handler, resp_type, error, body = item
-            log.debug(f"_event_worker: dispatching {handler.__name__} for event 0x{resp_type:02X}")
             try:
-                handler(resp_type, error, body)
-            except Exception:
-                log.error(f"_event_worker: handler {handler.__name__} for 0x{resp_type:02X} raised", exc_info=True)
-            log.debug(f"_event_worker: {handler.__name__} returned")
+                while True:
+                    batch.append(self._event_queue.get_nowait())
+            except queue.Empty:
+                pass
+            stop_idxs = [i for i, (_, rt, _e, _b) in enumerate(batch) if rt == RESP_STOPPED]
+            last_stop = stop_idxs[-1] if stop_idxs else -1
+            for i, (handler, resp_type, error, body) in enumerate(batch):
+                if resp_type == RESP_RESUMED and i < last_stop:
+                    log.debug("_event_worker: coalesced RESUMED (STOPPED later in batch)")
+                    continue
+                log.debug(f"_event_worker: dispatching {handler.__name__} for event 0x{resp_type:02X}")
+                try:
+                    handler(resp_type, error, body)
+                except Exception:
+                    log.error(f"_event_worker: handler {handler.__name__} for 0x{resp_type:02X} raised", exc_info=True)
         log.debug("_event_worker: exited")
 
     def _command(

@@ -3,7 +3,7 @@ Edge-case and error-path tests for the VICE C64 agent.
 
 These exercise branches the happy-path suite does not reach: request-id
 wraparound, disconnect tolerance, unhandled events, multi-frame error/timeout
-handling, the step-vs-resume optimisation in hooks, and the swallowed
+handling, the resumed-hook forwarding, and the swallowed
 set_process_state failure in commands.on_resume.
 """
 
@@ -58,10 +58,6 @@ class TestDisconnect:
         client.disconnect()                          # second call on a None sock is a no-op
         assert client._sock is None
 
-    def test_has_pending_events_false_when_idle(self, connected_client):
-        client, _ = connected_client
-        assert client.has_pending_events() is False
-
 
 # ── unhandled events ────────────────────────────────────────────────────────────
 
@@ -93,29 +89,18 @@ class TestCommandMultiErrors:
             client._command_multi(CMD_PING, terminal_resp_type=RESP_PING, timeout=0)
 
 
-# ── hooks: step skips the resume state change ────────────────────────────────────
+# ── hooks: resumed forwards unconditionally (coalescing lives in the worker) ─────
 
-class TestResumedStepSkip:
+class TestResumedForwards:
     def setup_method(self):
         commands.STATE.vice = None
 
     def teardown_method(self):
         commands.STATE.vice = None
 
-    def test_resumed_skips_on_resume_when_stop_already_queued(self):
-        """When a STOPPED event is already queued, a RESUMED event is part of a
-        step and must NOT trigger the expensive on_resume() state change."""
-        vice = MagicMock()
-        vice.has_pending_events.return_value = True
-        commands.STATE.vice = vice
-        with patch.object(commands, 'on_resume') as mock_resume:
-            hooks._on_resumed(RESP_RESUMED, 0, b'\x00\xc0')
-            mock_resume.assert_not_called()
-
-    def test_resumed_calls_on_resume_when_no_pending_events(self):
-        vice = MagicMock()
-        vice.has_pending_events.return_value = False
-        commands.STATE.vice = vice
+    def test_resumed_always_calls_on_resume(self):
+        """Step coalescing lives in the event worker; the hook forwards
+        unconditionally."""
         with patch.object(commands, 'on_resume') as mock_resume:
             hooks._on_resumed(RESP_RESUMED, 0, b'\x00\xc0')
             mock_resume.assert_called_once()

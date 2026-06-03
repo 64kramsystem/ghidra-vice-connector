@@ -719,18 +719,22 @@ class TestEvents:
 
         assert 'resumed' in events
 
-    def test_multiple_events_in_sequence(self, connected_client):
+    def test_stopped_then_resumed_both_dispatch(self, connected_client):
+        """A stop followed by a resume is two real transitions — nothing to
+        coalesce regardless of batching."""
         client, server = connected_client
         log = []
+        done = threading.Event()
         client.on_event(RESP_STOPPED, lambda t, e, b: log.append('stopped'))
         client.on_event(RESP_RESUMED, lambda t, e, b: log.append('resumed'))
+        client.on_event(0x70, lambda t, e, b: done.set())
 
-        server.send_event(RESP_RESUMED, struct.pack('<H', 0xC000))
         server.send_event(RESP_STOPPED, struct.pack('<H', 0xC100))
-        time.sleep(0.1)
+        server.send_event(RESP_RESUMED, struct.pack('<H', 0xC000))
+        server.send_event(0x70)
 
-        assert 'resumed' in log
-        assert 'stopped' in log
+        assert done.wait(2), "sentinel never dispatched"
+        assert log == ['stopped', 'resumed']
 
     def test_event_handler_exception_does_not_crash_recv_thread(self, connected_client):
         client, server = connected_client
@@ -1034,3 +1038,79 @@ class TestOrphanErrorLogging:
                 time.sleep(0.02)
         assert any('0x8F' in r.message and 'ORPHAN' in r.message.upper()
                    for r in caplog.records), "orphan error response was not logged"
+
+
+# ── event coalescing ───────────────────────────────────────────────────────────
+
+class TestEventCoalescing:
+    """The event worker drains the queue into a batch and drops a RESUMED that
+    has a later STOPPED in the same batch (the step case). A blocking non-state
+    handler (the dam) makes batching deterministic; a non-state sentinel proves
+    batch completion."""
+
+    DAM      = 0x55
+    SENTINEL = 0x70
+
+    def _wait_queued(self, client, n, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if client._event_queue.qsize() >= n:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_resumed_coalesced_when_stopped_in_same_batch(self, connected_client):
+        client, server = connected_client
+        log = []
+        dam = threading.Event()
+        dam_started = threading.Event()
+        done = threading.Event()
+        client.on_event(self.DAM,
+                        lambda t, e, b: (log.append('dam'), dam_started.set(), dam.wait(2)))
+        client.on_event(RESP_STOPPED, lambda t, e, b: log.append('stopped'))
+        client.on_event(RESP_RESUMED, lambda t, e, b: log.append('resumed'))
+        client.on_event(self.SENTINEL, lambda t, e, b: (log.append('sentinel'), done.set()))
+
+        # Send the dam alone and wait until the worker is parked inside it, so
+        # everything sent afterwards is guaranteed to drain as one batch.
+        server.send_event(self.DAM)
+        assert dam_started.wait(2), "dam handler never started"
+        server.send_event(RESP_RESUMED, struct.pack('<H', 0xC000))
+        server.send_event(RESP_STOPPED, struct.pack('<H', 0xC003))
+        server.send_event(self.SENTINEL)
+        assert self._wait_queued(client, 3), "events never reached the queue"
+        dam.set()
+
+        assert done.wait(2), "sentinel never dispatched"
+        assert log == ['dam', 'stopped', 'sentinel']
+
+    def test_resumed_without_stopped_dispatches(self, connected_client):
+        client, server = connected_client
+        log = []
+        done = threading.Event()
+        client.on_event(RESP_RESUMED, lambda t, e, b: log.append('resumed'))
+        client.on_event(self.SENTINEL, lambda t, e, b: done.set())
+
+        server.send_event(RESP_RESUMED, struct.pack('<H', 0xC000))
+        server.send_event(self.SENTINEL)
+
+        assert done.wait(2), "sentinel never dispatched"
+        assert log == ['resumed']
+
+    def test_handler_exception_does_not_kill_the_batch(self, connected_client):
+        client, server = connected_client
+        done = threading.Event()
+        dam = threading.Event()
+        dam_started = threading.Event()
+        client.on_event(self.DAM, lambda t, e, b: (dam_started.set(), dam.wait(2)))
+        client.on_event(RESP_STOPPED, lambda t, e, b: 1 / 0)
+        client.on_event(self.SENTINEL, lambda t, e, b: done.set())
+
+        server.send_event(self.DAM)
+        assert dam_started.wait(2), "dam handler never started"
+        server.send_event(RESP_STOPPED, struct.pack('<H', 0xC000))
+        server.send_event(self.SENTINEL)
+        assert self._wait_queued(client, 2), "events never reached the queue"
+        dam.set()
+
+        assert done.wait(2), "exception in one handler killed the batch"
