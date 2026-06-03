@@ -133,7 +133,6 @@ class TestInstallAndFire:
 
     def test_installed_resumed_handler_delegates_to_on_resume(self):
         vice = MagicMock()
-        vice.has_pending_events.return_value = False
         commands.STATE.vice = vice
         hooks.install_hooks()
 
