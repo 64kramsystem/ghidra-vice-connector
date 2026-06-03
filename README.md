@@ -117,7 +117,7 @@ pip install pytest
 pytest
 ```
 
-CI (`.github/workflows/build.yml`) resolves the latest Ghidra **12.1** release, builds the extension with JDK 21, and runs the test suite.
+CI (`.github/workflows/build.yml`) resolves the latest Ghidra **12.1** release, builds the extension with JDK 21, runs the test suite, and on `master` publishes a version-matched release artifact.
 
 ## License
 
