@@ -266,7 +266,7 @@ class TestStopResume:
 class TestPathConstants:
     """
     Path strings in commands.py must be consistent with the schema hierarchy
-    defined in schema_vice.xml.
+    defined in schema.xml.
     """
 
     def test_thread_path_is_child_of_c64(self):
