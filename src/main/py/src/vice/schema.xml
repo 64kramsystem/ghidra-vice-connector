@@ -5,6 +5,9 @@
         Hierarchy:
           Session
           └── C64          (Process — the emulated C64)
+              ├── Environment  (VICE version/connection, memory banks)
+              │   └── Banks
+              │       └── [name]  (bank metadata; reads use bank 0)
               ├── Threads
               │   └── [0]  (Thread — the 6510 CPU)
               │       └── Stack
@@ -32,11 +35,40 @@
         <interface name="Process"/>
         <interface name="ExecutionStateful"/>
         <interface name="Aggregate"/>
+        <attribute name="Environment" schema="Environment" required="yes" fixed="yes"/>
         <attribute name="Threads" schema="ThreadContainer" required="yes" fixed="yes"/>
         <attribute name="Memory" schema="MemoryContainer" required="yes" fixed="yes"/>
         <attribute name="Breakpoints" schema="BreakpointContainer" required="yes" fixed="yes"/>
         <attribute name="_display" schema="STRING"/>
         <attribute name="_state" schema="STRING"/>
+    </schema>
+
+    <schema name="Environment" elementResync="NEVER" attributeResync="NEVER">
+        <interface name="Environment"/>
+        <interface name="Aggregate"/>
+        <element schema="VOID"/>
+        <attribute name="OS" schema="STRING"/>
+        <attribute name="Arch" schema="STRING"/>
+        <attribute name="Endian" schema="STRING"/>
+        <attribute name="Debugger" schema="STRING"/>
+        <attribute-alias from="_os" to="OS"/>
+        <attribute-alias from="_arch" to="Arch"/>
+        <attribute-alias from="_endian" to="Endian"/>
+        <attribute-alias from="_debugger" to="Debugger"/>
+        <attribute name="Banks" schema="BankContainer" required="yes" fixed="yes"/>
+        <attribute name="_display" schema="STRING"/>
+        <attribute schema="VOID"/>
+    </schema>
+
+    <schema name="BankContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Aggregate"/>
+        <element schema="ViceBank"/>
+    </schema>
+
+    <schema name="ViceBank" elementResync="NEVER" attributeResync="NEVER">
+        <attribute name="_display" schema="STRING"/>
+        <attribute name="id" schema="INT"/>
+        <attribute schema="VOID"/>
     </schema>
 
     <schema name="ThreadContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">

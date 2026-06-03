@@ -45,6 +45,9 @@ MEM_PATH     = 'C64.Memory'
 MEM_REGION_PATH = 'C64.Memory[{key}]'
 BPS_PATH     = 'C64.Breakpoints'
 BP_PATH      = 'C64.Breakpoints[{n}]'
+ENV_PATH     = 'C64.Environment'
+BANKS_PATH   = 'C64.Environment.Banks'
+BANK_PATH    = 'C64.Environment.Banks[{name}]'
 
 # ── Shared agent state ────────────────────────────────────────────────────────
 # Follows the GDB/Frida agent pattern: require_*() enforces preconditions,
@@ -147,6 +150,8 @@ def populate_initial_state():
                 trace.snapshot('Initial snapshot')
                 log.debug("populate_initial_state(): skeleton")
                 _create_object_skeleton()
+                log.debug("populate_initial_state(): environment")
+                put_environment()
                 log.debug("populate_initial_state(): memory regions")
                 put_memory_regions()
                 log.debug("populate_initial_state(): registers")
@@ -274,6 +279,35 @@ def put_registers():
     thread.set_value('_display', f'6510 CPU  PC=0x{pc:04X}')
     thread.insert()
     log.debug("put_registers() complete")
+
+
+# ── Environment population ────────────────────────────────────────────────────
+
+def put_environment():
+    """Populate the Environment node: VICE version, connection, memory banks."""
+    t = STATE.trace
+    vice = STATE.require_vice()
+    version = vice.vice_info()
+
+    env = t.create_object(ENV_PATH)
+    env.set_value('_arch', '6502')
+    env.set_value('_os', 'C64')
+    env.set_value('_endian', 'little')
+    env.set_value('_debugger', f'VICE {version}')
+    env.set_value('_display', f'VICE {version} @ {vice.host}:{vice.port}')
+    env.insert()
+
+    banks = t.create_object(BANKS_PATH)
+    banks.insert()
+    # Banks are static per machine; memory reads always use bank 0 (the default bank),
+    # so this is informational metadata. Keyed by name: VICE reuses ids (0 is both
+    # 'default' and 'cpu').
+    for bank in vice.banks_available():
+        obj = t.create_object(BANK_PATH.format(name=bank.name))
+        obj.set_value('_display', f'{bank.name} (id {bank.id})')
+        obj.set_value('id', bank.id)
+        obj.insert()
+    log.debug("put_environment() complete")
 
 
 # ── Memory region population ──────────────────────────────────────────────────
