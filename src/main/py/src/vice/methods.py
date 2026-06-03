@@ -8,8 +8,10 @@ The 'action' keyword controls which built-in Ghidra action the button binds to.
 
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from typing import Annotated
 
-from ghidratrace.client import Address, AddressRange, MethodRegistry, TraceObject
+from ghidratrace.client import (Address, AddressRange, MethodRegistry, ParamDesc,
+                                TraceObject)
 
 from . import arch, commands
 from .util import CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE
@@ -137,7 +139,8 @@ def refresh_breakpoints(node: BreakpointContainer):
 # ── Breakpoint management ─────────────────────────────────────────────────────
 
 @REGISTRY.method(action='break_sw_execute', display='Set Execute Breakpoint')
-def set_breakpoint_execute(process: C64, address: Address):
+def set_breakpoint_execute(process: C64,
+                           address: Annotated[Address, ParamDesc(display='Address')]):
     """Set an execution breakpoint at the given address."""
     vice = commands.STATE.require_vice()
     n = vice.checkpoint_set(address.offset, address.offset, cpu_op=CPU_OP_EXEC)
@@ -146,7 +149,8 @@ def set_breakpoint_execute(process: C64, address: Address):
 
 
 @REGISTRY.method(action='break_read', display='Set Read Watchpoint')
-def set_watchpoint_read(process: C64, range: AddressRange):
+def set_watchpoint_read(process: C64,
+                        range: Annotated[AddressRange, ParamDesc(display='Range')]):
     """Set a read watchpoint on an address range."""
     vice = commands.STATE.require_vice()
     n = vice.checkpoint_set(range.min.offset, range.max.offset, cpu_op=CPU_OP_LOAD)
@@ -155,7 +159,8 @@ def set_watchpoint_read(process: C64, range: AddressRange):
 
 
 @REGISTRY.method(action='break_write', display='Set Write Watchpoint')
-def set_watchpoint_write(process: C64, range: AddressRange):
+def set_watchpoint_write(process: C64,
+                         range: Annotated[AddressRange, ParamDesc(display='Range')]):
     """Set a write watchpoint on an address range."""
     vice = commands.STATE.require_vice()
     n = vice.checkpoint_set(range.min.offset, range.max.offset, cpu_op=CPU_OP_STORE)
@@ -174,7 +179,8 @@ def delete_breakpoint(breakpoint: ViceBreakpoint):
 
 
 @REGISTRY.method(action='toggle', display='Toggle Breakpoint')
-def toggle_breakpoint(breakpoint: ViceBreakpoint, enabled: bool):
+def toggle_breakpoint(breakpoint: ViceBreakpoint,
+                      enabled: Annotated[bool, ParamDesc(display='Enabled')]):
     """Enable or disable a VICE checkpoint."""
     vice = commands.STATE.require_vice()
     n = int(breakpoint.path.split('[')[-1].rstrip(']'))
@@ -186,7 +192,8 @@ def toggle_breakpoint(breakpoint: ViceBreakpoint, enabled: bool):
 # ── Memory read/write ─────────────────────────────────────────────────────────
 
 @REGISTRY.method(action='read_mem', display='Read Memory')
-def read_memory(process: C64, range: AddressRange):
+def read_memory(process: C64,
+                range: Annotated[AddressRange, ParamDesc(display='Range')]):
     """Refresh a specific memory range from VICE."""
     commands.STATE.require_vice()
     start  = range.min.offset
@@ -195,7 +202,9 @@ def read_memory(process: C64, range: AddressRange):
 
 
 @REGISTRY.method(action='write_mem', display='Write Memory')
-def write_memory(process: C64, address: Address, data: bytes):
+def write_memory(process: C64,
+                 address: Annotated[Address, ParamDesc(display='Address')],
+                 data: Annotated[bytes, ParamDesc(display='Data')]):
     """Write bytes into VICE memory at the given address."""
     commands.STATE.require_vice().memory_set(address.offset, data)
 
@@ -203,7 +212,9 @@ def write_memory(process: C64, address: Address, data: bytes):
 # ── Register write ───────────────────────────────────────────────────────────
 
 @REGISTRY.method(action='write_reg', display='Write Register')
-def write_register(frame: C64Frame, name: str, value: int):
+def write_register(frame: C64Frame,
+                   name: Annotated[str, ParamDesc(display='Register')],
+                   value: Annotated[int, ParamDesc(display='Value')]):
     """Write a single register value to VICE."""
     vice = commands.STATE.require_vice()
     # Map Ghidra register name back to VICE name
