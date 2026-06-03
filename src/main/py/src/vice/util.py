@@ -14,6 +14,7 @@ import socket
 import struct
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger('vice-agent')
@@ -57,13 +58,17 @@ CMD_RESET                = 0xCC
 # ── Response / event types ─────────────────────────────────────────────────────
 
 RESP_MEMORY_GET           = 0x01
+RESP_MEMORY_SET           = 0x02
 RESP_CHECKPOINT_INFO      = 0x11
+RESP_CHECKPOINT_DELETE    = 0x13
 RESP_CHECKPOINT_LIST      = 0x14
-RESP_REGISTERS_GET        = 0x31
+RESP_CHECKPOINT_TOGGLE    = 0x15
+RESP_REGISTERS_GET        = 0x31  # response to both REGISTERS_GET and REGISTERS_SET
 RESP_BANKS_AVAILABLE      = 0x82
 RESP_REGISTERS_AVAILABLE  = 0x83
 RESP_VICE_INFO            = 0x85
 RESP_PING                 = 0x81
+RESP_RESET                = 0xCC
 RESP_STOPPED              = 0x62  # event: CPU stopped (breakpoint / step complete)
 RESP_RESUMED              = 0x63  # event: CPU resumed
 
@@ -90,30 +95,73 @@ _CHECKPOINT_INFO_SIZE = struct.calcsize(_CHECKPOINT_INFO_FMT)  # 22
 
 
 class ViceError(Exception):
-    def __init__(self, code: int):
+    """VICE returned a non-zero error code for a command."""
+
+    def __init__(self, code: int, cmd: Optional[int] = None, request_id: Optional[int] = None):
         self.code = code
-        super().__init__(f"VICE BMP error 0x{code:02X}")
+        self.cmd = cmd
+        self.request_id = request_id
+        detail = f" (command 0x{cmd:02X}, request {request_id})" if cmd is not None else ""
+        super().__init__(f"VICE BMP error 0x{code:02X}{detail}")
 
 
-def _parse_checkpoint_info(body: bytes, offset: int = 0) -> dict:
+class ViceProtocolError(Exception):
+    """The response type does not match what the command expects."""
+
+    def __init__(self, cmd: int, request_id: int, expected, actual: int):
+        self.cmd = cmd
+        self.request_id = request_id
+        self.expected = expected
+        self.actual = actual
+        if isinstance(expected, int):
+            exp = f"0x{expected:02X}"
+        else:
+            exp = '{' + ', '.join(f"0x{e:02X}" for e in sorted(expected)) + '}'
+        super().__init__(
+            f"command 0x{cmd:02X} (request {request_id}) expected response type "
+            f"{exp}, got 0x{actual:02X}")
+
+
+@dataclass(frozen=True)
+class Checkpoint:
+    number: int
+    start: int
+    end: int
+    enabled: bool = True
+    cpu_op: int = CPU_OP_EXEC
+    stop_on_hit: bool = True
+    currently_hit: bool = False
+    temporary: bool = False
+    hit_count: int = 0
+    ignore_count: int = 0
+    has_condition: bool = False
+
+
+@dataclass(frozen=True)
+class Bank:
+    id: int
+    name: str
+
+
+def _parse_checkpoint_info(body: bytes, offset: int = 0) -> Checkpoint:
     """Parse one CHECKPOINT_INFO item from a response body."""
     (number, hit, start, end, stop, enabled, cpu_op, temp,
      hit_count, ignore_count, has_condition) = struct.unpack_from(
         _CHECKPOINT_INFO_FMT, body, offset
     )
-    return {
-        'number':        number,
-        'currently_hit': bool(hit),
-        'start':         start,
-        'end':           end,
-        'stop_on_hit':   bool(stop),
-        'enabled':       bool(enabled),
-        'cpu_op':        cpu_op,
-        'temporary':     bool(temp),
-        'hit_count':     hit_count,
-        'ignore_count':  ignore_count,
-        'has_condition': bool(has_condition),
-    }
+    return Checkpoint(
+        number=number,
+        start=start,
+        end=end,
+        enabled=bool(enabled),
+        cpu_op=cpu_op,
+        stop_on_hit=bool(stop),
+        currently_hit=bool(hit),
+        temporary=bool(temp),
+        hit_count=hit_count,
+        ignore_count=ignore_count,
+        has_condition=bool(has_condition),
+    )
 
 
 class ViceBmpClient:
@@ -226,6 +274,12 @@ class ViceBmpClient:
                 stx, api_ver, body_len, resp_type, error, req_id = struct.unpack(
                     RESP_HDR_FMT, raw
                 )
+                # Validate before trusting body_len: after a framing error there is no
+                # reliable resync marker, so the stream is dead.
+                if stx != STX or api_ver != API_VERSION:
+                    raise ConnectionError(
+                        f"corrupt response header (STX=0x{stx:02X}, API=0x{api_ver:02X}): "
+                        f"stream desynced")
                 body = self._recv_exact(body_len) if body_len else b''
 
                 if req_id == EVENT_REQUEST_ID:
@@ -245,8 +299,12 @@ class ViceBmpClient:
                     if q is not None:
                         log.debug(f"recv RESPONSE: type=0x{resp_type:02X} rid={req_id} error={error} body_len={body_len} -> pending queue")
                         q.put_nowait((resp_type, error, body))
+                    elif error != 0x00:
+                        # Fire-and-forget ack (step/resume/interrupt) carrying an error —
+                        # the command was rejected and nobody is waiting for the reply.
+                        log.error(f"recv ORPHAN with VICE error: type=0x{resp_type:02X} rid={req_id} error=0x{error:02X}")
                     else:
-                        log.debug(f"recv ORPHAN: type=0x{resp_type:02X} rid={req_id} error={error} (pending_ids={pending_ids})")
+                        log.debug(f"recv ORPHAN: type=0x{resp_type:02X} rid={req_id} (pending_ids={pending_ids})")
             except Exception:
                 if self._running:
                     log.error("_recv_loop: exception", exc_info=True)
@@ -277,9 +335,15 @@ class ViceBmpClient:
         log.debug("_event_worker: exited")
 
     def _command(
-        self, cmd: int, payload: bytes = b'', timeout: float = 5.0
+        self, cmd: int, payload: bytes = b'', timeout: float = 5.0,
+        expect: Optional[int] = None,
     ) -> Tuple[int, bytes]:
-        """Send a command and block until its (single) response arrives."""
+        """Send a command and block until its (single) response arrives.
+
+        A non-zero VICE error raises ViceError (checked first: on error frames the
+        response type is less meaningful). A response type other than `expect`
+        raises ViceProtocolError.
+        """
         rid = self._alloc_id()
         log.debug(f"_command: cmd=0x{cmd:02X} rid={rid} timeout={timeout}")
         q: queue.Queue = queue.Queue()
@@ -290,7 +354,10 @@ class ViceBmpClient:
             resp_type, error, body = q.get(timeout=timeout)
             if error != 0x00:
                 log.error(f"_command: cmd=0x{cmd:02X} rid={rid} VICE error=0x{error:02X}")
-                raise ViceError(error)
+                raise ViceError(error, cmd=cmd, request_id=rid)
+            if expect is not None and resp_type != expect:
+                log.error(f"_command: cmd=0x{cmd:02X} rid={rid} unexpected resp type 0x{resp_type:02X} (expected 0x{expect:02X})")
+                raise ViceProtocolError(cmd, rid, expect, resp_type)
             log.debug(f"_command: cmd=0x{cmd:02X} rid={rid} -> resp=0x{resp_type:02X} body_len={len(body)}")
             return resp_type, body
         except queue.Empty:
@@ -306,11 +373,13 @@ class ViceBmpClient:
         payload: bytes = b'',
         terminal_resp_type: int = 0,
         timeout: float = 5.0,
+        expect: Optional[frozenset] = None,
     ) -> List[Tuple[int, bytes]]:
         """
         Send a command and collect ALL response frames until one with
         resp_type == terminal_resp_type arrives.
         Returns list of (resp_type, body) for all frames including the terminal.
+        Frames with a response type outside `expect` raise ViceProtocolError.
         """
         rid = self._alloc_id()
         q: queue.Queue = queue.Queue(maxsize=1000)
@@ -326,7 +395,9 @@ class ViceBmpClient:
                     raise TimeoutError(f"command 0x{cmd:02X} timed out collecting multi-frame response")
                 resp_type, error, body = q.get(timeout=remaining)
                 if error != 0x00:
-                    raise ViceError(error)
+                    raise ViceError(error, cmd=cmd, request_id=rid)
+                if expect is not None and resp_type not in expect:
+                    raise ViceProtocolError(cmd, rid, expect, resp_type)
                 responses.append((resp_type, body))
                 if resp_type == terminal_resp_type:
                     break
@@ -346,7 +417,8 @@ class ViceBmpClient:
           per item: item_size (1)  reg_id (1)  name_len (1)  name (name_len bytes)
           item_size = 2 + name_len
         """
-        _, body = self._command(CMD_REGISTERS_AVAILABLE, struct.pack('<B', MEMSPACE_MAIN))
+        _, body = self._command(CMD_REGISTERS_AVAILABLE, struct.pack('<B', MEMSPACE_MAIN),
+                                expect=RESP_REGISTERS_AVAILABLE)
         count = struct.unpack_from('<H', body, 0)[0]
         offset = 2
         for _ in range(count):
@@ -364,7 +436,7 @@ class ViceBmpClient:
     def ping(self) -> bool:
         log.debug("ping()")
         try:
-            self._command(CMD_PING)
+            self._command(CMD_PING, expect=RESP_PING)
             log.debug("ping(): success")
             return True
         except Exception as e:
@@ -394,7 +466,8 @@ class ViceBmpClient:
         for name, val in values.items():
             rid = self.reg_name_to_id[name]
             payload += struct.pack('<BBH', 3, rid, val & 0xFFFF)
-        self._command(CMD_REGISTERS_SET, payload)
+        # VICE answers REGISTERS_SET with a register-info response (0x31).
+        self._command(CMD_REGISTERS_SET, payload, expect=RESP_REGISTERS_GET)
 
     def memory_get(
         self,
@@ -418,7 +491,7 @@ class ViceBmpClient:
             memspace,
             bank_id,
         )
-        _, body = self._command(CMD_MEMORY_GET, payload)
+        _, body = self._command(CMD_MEMORY_GET, payload, expect=RESP_MEMORY_GET)
         # Strip the 2-byte length prefix that VICE prepends to the memory data
         mem_len = struct.unpack_from('<H', body, 0)[0]
         return body[2:2 + mem_len]
@@ -452,7 +525,7 @@ class ViceBmpClient:
             memspace,
             bank_id,
         ) + data
-        self._command(CMD_MEMORY_SET, payload)
+        self._command(CMD_MEMORY_SET, payload, expect=RESP_MEMORY_SET)
 
     def registers_get(self, memspace: int = MEMSPACE_MAIN) -> Dict[str, int]:
         """
@@ -463,7 +536,8 @@ class ViceBmpClient:
           per item: item_size (1)  reg_id (1)  value (2 LE)
         """
         log.debug(f"registers_get(memspace={memspace})")
-        _, body = self._command(CMD_REGISTERS_GET, struct.pack('<B', memspace))
+        _, body = self._command(CMD_REGISTERS_GET, struct.pack('<B', memspace),
+                                expect=RESP_REGISTERS_GET)
         count = struct.unpack_from('<H', body, 0)[0]
         offset = 2
         result = {}
@@ -504,22 +578,24 @@ class ViceBmpClient:
             cpu_op,
             1 if temporary else 0,
         )
-        _, body = self._command(CMD_CHECKPOINT_SET, payload)
+        _, body = self._command(CMD_CHECKPOINT_SET, payload, expect=RESP_CHECKPOINT_INFO)
         cp = _parse_checkpoint_info(body)
-        log.info(f"checkpoint_set(): VICE assigned number={cp['number']}")
-        return cp['number']
+        log.info(f"checkpoint_set(): VICE assigned number={cp.number}")
+        return cp.number
 
     def checkpoint_delete(self, number: int):
         log.info(f"checkpoint_delete({number})")
-        self._command(CMD_CHECKPOINT_DELETE, struct.pack('<I', number))
+        self._command(CMD_CHECKPOINT_DELETE, struct.pack('<I', number),
+                      expect=RESP_CHECKPOINT_DELETE)
 
     def checkpoint_toggle(self, number: int, enabled: bool):
         log.info(f"checkpoint_toggle({number}, enabled={enabled})")
-        self._command(CMD_CHECKPOINT_TOGGLE, struct.pack('<IB', number, 1 if enabled else 0))
+        self._command(CMD_CHECKPOINT_TOGGLE, struct.pack('<IB', number, 1 if enabled else 0),
+                      expect=RESP_CHECKPOINT_TOGGLE)
 
-    def checkpoint_list(self) -> List[dict]:
+    def checkpoint_list(self) -> List[Checkpoint]:
         """
-        Returns list of dicts with checkpoint info.
+        Returns the current checkpoints.
 
         VICE sends one RESP_CHECKPOINT_INFO (0x11) frame per checkpoint,
         followed by a terminal RESP_CHECKPOINT_LIST (0x14) frame.
@@ -529,12 +605,13 @@ class ViceBmpClient:
         frames = self._command_multi(
             CMD_CHECKPOINT_LIST,
             terminal_resp_type=RESP_CHECKPOINT_LIST,
+            expect=frozenset({RESP_CHECKPOINT_INFO, RESP_CHECKPOINT_LIST}),
         )
         checkpoints = []
         for resp_type, body in frames:
             if resp_type == RESP_CHECKPOINT_INFO:
                 cp = _parse_checkpoint_info(body)
-                log.debug(f"checkpoint_list(): cp #{cp['number']} 0x{cp['start']:04X}-0x{cp['end']:04X} op=0x{cp['cpu_op']:02X} en={cp['enabled']}")
+                log.debug(f"checkpoint_list(): cp #{cp.number} 0x{cp.start:04X}-0x{cp.end:04X} op=0x{cp.cpu_op:02X} en={cp.enabled}")
                 checkpoints.append(cp)
         log.info(f"checkpoint_list(): {len(checkpoints)} checkpoints")
         return checkpoints
@@ -548,7 +625,7 @@ class ViceBmpClient:
         rid = self._alloc_id()
         log.debug(f"_send_no_reply: cmd=0x{cmd:02X} rid={rid} (fire-and-forget)")
         self._send_raw(cmd, payload, rid)
-        # No pending queue — any response with this rid is silently dropped.
+        # No pending queue — the ack is orphaned (the recv loop logs it if it carries an error).
 
     def step(self, count: int = 1, step_over: bool = False):
         """
@@ -592,33 +669,26 @@ class ViceBmpClient:
         Reset the machine.
         reset_type: 0=soft, 1=hard, 8=drive8, 9=drive9
         """
-        self._command(CMD_RESET, struct.pack('<B', reset_type))
+        self._command(CMD_RESET, struct.pack('<B', reset_type), expect=RESP_RESET)
 
     def vice_info(self) -> str:
         """
-        Return the VICE version string.
+        Return the VICE version as 'major.minor.patch'.
 
-        Modern VICE (3.x+) encodes version as binary integers:
-          major(1) minor(1) patch(1) [svn_rev(1)]
-        Older versions used: ML(1) version_string(ML) SL(1) svn_string(SL)
+        Body: verlen(1) version(verlen bytes: major minor patch rc) svnlen(1) svn(svnlen)
         """
-        _, body = self._command(CMD_VICE_INFO)
-        # Detect binary format: major(1) minor(1) patch(1).
-        # In the legacy text format body[1] is a printable ASCII char (>= 0x20);
-        # in the binary format it's the minor version number (< 0x20).
-        if len(body) >= 3 and body[0] < 20 and body[1] < 0x20:
-            return f"{body[0]}.{body[1]}.{body[2]}"
-        # Legacy text format: ML(1) version_string(ML)
-        ml = body[0]
-        return body[1:1 + ml].decode('ascii', errors='replace')
+        _, body = self._command(CMD_VICE_INFO, expect=RESP_VICE_INFO)
+        verlen = body[0]
+        version = body[1:1 + verlen]
+        return '.'.join(str(b) for b in version[:3])
 
-    def banks_available(self) -> List[dict]:
+    def banks_available(self) -> List[Bank]:
         """
-        Returns list of {id, name} dicts for available memory banks.
+        Returns the available memory banks.
 
         Response: count(2 LE) [item_size(1) bank_id(2 LE) name_len(1) name(N)]*
         """
-        _, body = self._command(CMD_BANKS_AVAILABLE)
+        _, body = self._command(CMD_BANKS_AVAILABLE, expect=RESP_BANKS_AVAILABLE)
         count = struct.unpack_from('<H', body, 0)[0]
         offset = 2
         banks = []
@@ -627,6 +697,6 @@ class ViceBmpClient:
             bank_id   = struct.unpack_from('<H', body, offset + 1)[0]
             name_len  = body[offset + 3]
             name      = body[offset + 4: offset + 4 + name_len].decode('ascii')
-            banks.append({'id': bank_id, 'name': name})
+            banks.append(Bank(id=bank_id, name=name))
             offset += 1 + item_size
         return banks

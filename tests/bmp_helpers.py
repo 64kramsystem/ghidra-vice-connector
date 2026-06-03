@@ -121,6 +121,11 @@ class MockViceServer:
             )
             self._conn.sendall(hdr + body)
 
+    def send_raw(self, data: bytes):
+        """Inject raw bytes into the connected client (corrupt headers, orphan frames)."""
+        if self._conn:
+            self._conn.sendall(data)
+
     @staticmethod
     def _recv_exact(conn: socket.socket, n: int) -> bytes:
         buf = bytearray()

@@ -13,7 +13,7 @@ import pytest
 
 # ghidratrace stubs are installed by conftest.py before this import
 from vice import commands, arch
-from vice.util import CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE
+from vice.util import CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE, Checkpoint
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -152,19 +152,17 @@ class TestPutBreakpoints:
         assert bp_paths == []
 
     def test_single_breakpoint_creates_object(self):
-        commands.STATE.vice.checkpoint_list.return_value = [{
-            'number': 1, 'start': 0xC000, 'end': 0xC000,
-            'enabled': True, 'cpu_op': CPU_OP_EXEC,
-        }]
+        commands.STATE.vice.checkpoint_list.return_value = [
+            Checkpoint(number=1, start=0xC000, end=0xC000, enabled=True, cpu_op=CPU_OP_EXEC),
+        ]
         commands.put_breakpoints()
         paths = [c.args[0] for c in commands.STATE.trace.create_object.call_args_list]
         assert any('Breakpoints[1]' in p for p in paths)
 
     def test_breakpoint_display_includes_address(self):
-        commands.STATE.vice.checkpoint_list.return_value = [{
-            'number': 1, 'start': 0xD020, 'end': 0xD020,
-            'enabled': True, 'cpu_op': CPU_OP_STORE,
-        }]
+        commands.STATE.vice.checkpoint_list.return_value = [
+            Checkpoint(number=1, start=0xD020, end=0xD020, enabled=True, cpu_op=CPU_OP_STORE),
+        ]
         commands.put_breakpoints()
         obj = commands.STATE.trace.create_object.return_value
         display_calls = [c for c in obj.set_value.call_args_list
@@ -174,9 +172,9 @@ class TestPutBreakpoints:
 
     def test_multiple_breakpoints_all_created(self):
         commands.STATE.vice.checkpoint_list.return_value = [
-            {'number': 1, 'start': 0xC000, 'end': 0xC000, 'enabled': True, 'cpu_op': CPU_OP_EXEC},
-            {'number': 2, 'start': 0xD000, 'end': 0xD000, 'enabled': True, 'cpu_op': CPU_OP_LOAD},
-            {'number': 3, 'start': 0xD400, 'end': 0xD41C, 'enabled': False, 'cpu_op': CPU_OP_STORE},
+            Checkpoint(number=1, start=0xC000, end=0xC000, enabled=True, cpu_op=CPU_OP_EXEC),
+            Checkpoint(number=2, start=0xD000, end=0xD000, enabled=True, cpu_op=CPU_OP_LOAD),
+            Checkpoint(number=3, start=0xD400, end=0xD41C, enabled=False, cpu_op=CPU_OP_STORE),
         ]
         commands.put_breakpoints()
         paths = [c.args[0] for c in commands.STATE.trace.create_object.call_args_list]
