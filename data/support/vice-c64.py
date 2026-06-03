@@ -21,7 +21,7 @@ log.info("=== VICE C64 TraceRmi agent starting ===")
 log.info(f"Python: {sys.executable} {sys.version}")
 log.info(f"PYTHONPATH: {os.environ.get('PYTHONPATH', '<not set>')}")
 
-host = os.environ.get('OPT_HOST', 'localhost')
+host = os.environ.get('OPT_HOST', '127.0.0.1')
 port = int(os.environ.get('OPT_PORT', '6502'))
 
 ghidra_host = os.environ.get('GHIDRA_TRACE_RMI_HOST')

@@ -445,7 +445,7 @@ fi
 # --- Phase 10: launch_connector -------------------------------------------
 # Drive the Debugger tool's "Configure and Launch <program> using -> VICE C64
 # Debugger" action, accepting the launch dialog with its defaults (OPT_HOST=
-# localhost, OPT_PORT matches VICE_PORT). The success assertion does not scrape
+# 127.0.0.1, OPT_PORT matches VICE_PORT). The success assertion does not scrape
 # any widget — it only checks the agent's own log — so this step just has to
 # get the launch dialog to its Launch button.
 PHASE="launch_connector"

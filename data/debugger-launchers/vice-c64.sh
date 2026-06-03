@@ -14,7 +14,7 @@
 #@env OPT_PYTHON_EXE:file="python3" "Python command" "Path to the Python 3 interpreter"
 #@env OPT_LOG_FILE:file="/tmp/vice-agent.log" "Log file" "Agent log file path"
 #@env OPT_LOG_LEVEL:LogLevel="DEBUG" "Log level" "Agent log verbosity"
-#@env OPT_HOST:str="localhost" "VICE Host" "Hostname or IP of the machine running VICE"
+#@env OPT_HOST:str="127.0.0.1" "VICE Host" "Hostname or IP of the machine running VICE"
 #@env OPT_PORT:int=6502 "VICE Port" "Binary Monitor TCP port (VICE default: 6502)"
 
 . "$MODULE_Debugger_rmi_trace_HOME/data/support/setuputils.sh"
