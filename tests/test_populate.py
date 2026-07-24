@@ -178,7 +178,7 @@ class TestOnStopBreakpointSync:
         commands.STATE.client = MagicMock()
 
     def test_on_stop_calls_put_breakpoints(self):
-        with patch.object(commands, 'put_breakpoints') as mock_put:
+        with patch.object(commands, 'put_breakpoints_from') as mock_put:
             commands.on_stop()
             mock_put.assert_called_once()
 

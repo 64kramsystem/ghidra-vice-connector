@@ -13,20 +13,18 @@ binary monitor client at a time.
 import os
 import re
 import socket
-import struct
-import threading
 import time
 
 import pytest
 
-from vice.util import (
-    ViceBmpClient, ViceError,
+from vice.controller import ViceController
+from vice.protocol import (
+    ViceBmpClient, ViceFailure, ViceValidationError,
     CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE,
-    RESP_STOPPED, RESP_RESUMED,
 )
 
-VICE_HOST = '127.0.0.1'
-VICE_PORT = 6502
+VICE_HOST = os.environ.get("VICE_HOST", "127.0.0.1")
+VICE_PORT = int(os.environ.get("VICE_PORT", "6502"))
 
 
 def _vice_reachable():
@@ -56,9 +54,27 @@ pytestmark = pytest.mark.skipif(
 def vice():
     """Single shared connection to the live VICE instance for the whole module."""
     client = ViceBmpClient(VICE_HOST, VICE_PORT)
-    client.connect()
-    yield client
-    client.disconnect()
+    controller = ViceController(client)
+    controller.connect()
+    controller.start_event_coordinator(assume_stopped=True)
+
+    class LiveVice:
+        def __getattr__(self, name):
+            return getattr(client, name)
+
+        def step(self, count=1, step_over=False):
+            return controller.step(
+                count, step_over=step_over, timeout_ms=5_000
+            )
+
+        def resume(self):
+            return controller.resume(timeout_ms=5_000)
+
+        def interrupt(self):
+            return controller.interrupt(timeout_ms=5_000)
+
+    yield LiveVice()
+    controller.close()
 
 
 # ── Connection and discovery ─────────────────────────────────────────────────
@@ -122,7 +138,7 @@ class TestLiveRegisters:
         vice.registers_set({'X': original['X'], 'Y': original['Y']})
 
     def test_write_unknown_register_raises(self, vice):
-        with pytest.raises(KeyError, match="Unknown register"):
+        with pytest.raises(ViceValidationError, match="unknown register"):
             vice.registers_set({'NONEXISTENT': 0})
 
     def test_pc_is_16bit(self, vice):
@@ -183,7 +199,9 @@ class TestLiveMemory:
 
 class TestLiveCheckpoints:
     def test_checkpoint_set_and_delete(self, vice):
-        cp_num = vice.checkpoint_set(0xC000, 0xC000, cpu_op=CPU_OP_EXEC)
+        cp_num = vice.checkpoint_set(
+            0xC000, 0xC000, cpu_op=CPU_OP_EXEC
+        ).number
         assert isinstance(cp_num, int)
         assert cp_num > 0
         cps = vice.checkpoint_list()
@@ -195,7 +213,9 @@ class TestLiveCheckpoints:
         assert cp_num not in numbers
 
     def test_checkpoint_toggle(self, vice):
-        cp_num = vice.checkpoint_set(0xD000, 0xD000, cpu_op=CPU_OP_EXEC)
+        cp_num = vice.checkpoint_set(
+            0xD000, 0xD000, cpu_op=CPU_OP_EXEC
+        ).number
         try:
             vice.checkpoint_toggle(cp_num, False)
             cps = vice.checkpoint_list()
@@ -214,7 +234,7 @@ class TestLiveCheckpoints:
             cpu_op=CPU_OP_LOAD,
             enabled=True,
             stop_on_hit=True,
-        )
+        ).number
         try:
             cps = vice.checkpoint_list()
             cp = next(c for c in cps if c.number == cp_num)
@@ -227,7 +247,9 @@ class TestLiveCheckpoints:
             vice.checkpoint_delete(cp_num)
 
     def test_write_watchpoint(self, vice):
-        cp_num = vice.checkpoint_set(0x0400, 0x0400, cpu_op=CPU_OP_STORE)
+        cp_num = vice.checkpoint_set(
+            0x0400, 0x0400, cpu_op=CPU_OP_STORE
+        ).number
         try:
             cps = vice.checkpoint_list()
             cp = next(c for c in cps if c.number == cp_num)
@@ -236,14 +258,16 @@ class TestLiveCheckpoints:
             vice.checkpoint_delete(cp_num)
 
     def test_delete_nonexistent_checkpoint_raises(self, vice):
-        with pytest.raises(ViceError):
+        with pytest.raises(ViceFailure):
             vice.checkpoint_delete(999999)
 
     def test_multiple_checkpoints(self, vice):
         nums = []
         try:
             for addr in (0xC000, 0xC100, 0xC200):
-                n = vice.checkpoint_set(addr, addr, cpu_op=CPU_OP_EXEC)
+                n = vice.checkpoint_set(
+                    addr, addr, cpu_op=CPU_OP_EXEC
+                ).number
                 nums.append(n)
             cps = vice.checkpoint_list()
             listed = {cp.number for cp in cps}
@@ -253,7 +277,7 @@ class TestLiveCheckpoints:
             for n in nums:
                 try:
                     vice.checkpoint_delete(n)
-                except ViceError:
+                except ViceFailure:
                     pass
 
 
@@ -261,64 +285,28 @@ class TestLiveCheckpoints:
 
 class TestLiveStepAndEvents:
     def test_step_into_fires_stopped_event(self, vice):
-        """Single step should trigger a RESP_STOPPED event."""
-        stopped = threading.Event()
-
-        def on_stopped(resp_type, error, body):
-            stopped.set()
-
-        vice.on_event(RESP_STOPPED, on_stopped)
-        vice.step(count=1, step_over=False)
-        assert stopped.wait(timeout=5), "Timed out waiting for STOPPED event"
+        result = vice.step(count=1, step_over=False)
+        assert result.event.kind == "stopped"
 
     def test_step_over_fires_stopped_event(self, vice):
-        stopped = threading.Event()
-
-        def on_stopped(resp_type, error, body):
-            stopped.set()
-
-        vice.on_event(RESP_STOPPED, on_stopped)
-        vice.step(count=1, step_over=True)
-        assert stopped.wait(timeout=5), "Timed out waiting for STOPPED event"
+        result = vice.step(count=1, step_over=True)
+        assert result.event.kind == "stopped"
 
     def test_resume_and_interrupt(self, vice):
-        """Resume, then interrupt — should get STOPPED event."""
-        stopped = threading.Event()
-
-        def on_stopped(resp_type, error, body):
-            stopped.set()
-
-        vice.on_event(RESP_STOPPED, on_stopped)
+        """Resume, then interrupt through the serialized controller."""
         vice.resume()
         time.sleep(0.2)
-        vice.interrupt()
-        assert stopped.wait(timeout=5), "Timed out waiting for STOPPED after interrupt"
-        # Drain any extra events
-        time.sleep(0.1)
+        result = vice.interrupt()
+        assert result.event.kind == "stopped"
 
     def test_multi_step_advances_pc(self, vice):
         """Multiple single steps should advance PC."""
-        stopped = threading.Event()
-
-        def on_stopped(resp_type, error, body):
-            stopped.set()
-
-        vice.on_event(RESP_STOPPED, on_stopped)
         for _ in range(3):
-            stopped.clear()
-            vice.step(count=1, step_over=False)
-            assert stopped.wait(timeout=5)
+            assert vice.step(count=1, step_over=False).event.kind == "stopped"
 
     def test_step_count_greater_than_one(self, vice):
         """Step with count=5 should eventually fire STOPPED."""
-        stopped = threading.Event()
-
-        def on_stopped(resp_type, error, body):
-            stopped.set()
-
-        vice.on_event(RESP_STOPPED, on_stopped)
-        vice.step(count=5, step_over=False)
-        assert stopped.wait(timeout=5)
+        assert vice.step(count=5, step_over=False).event.kind == "stopped"
 
 
 # ── Reset ────────────────────────────────────────────────────────────────────

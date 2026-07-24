@@ -1,4 +1,3 @@
-import queue
 import struct
 import time
 from unittest.mock import MagicMock
@@ -14,15 +13,18 @@ from vice.protocol import (
     EVENT_REQUEST_ID,
     MAX_RESPONSE_BODY,
     RESP_ADVANCE_INSTRUCTIONS,
+    RESP_BANKS_AVAILABLE,
     RESP_HDR_FMT,
     RESP_PING,
     STX,
     Cursor,
     ViceBmpClient,
+    ViceCommandError,
     ViceConnectionError,
     VicePartialWriteError,
     ViceProtocolError,
     ViceTimeoutError,
+    Frame,
     parse_checkpoint_info,
 )
 
@@ -109,10 +111,14 @@ class TestTransport:
         client._running = True
         client._sock = MagicMock()
         client._next_id = EVENT_REQUEST_ID - 1
-        first, _ = client._alloc_pending()
+        first, _ = client._alloc_pending(
+            CMD_PING, (RESP_PING,), RESP_PING, 1
+        )
         assert first == EVENT_REQUEST_ID - 1
-        client._pending[1] = queue.Queue()
-        second, _ = client._alloc_pending()
+        client._alloc_pending(CMD_PING, (RESP_PING,), RESP_PING, 1)
+        second, _ = client._alloc_pending(
+            CMD_PING, (RESP_PING,), RESP_PING, 1
+        )
         assert second == 2
 
     def test_direct_execution_ack_is_retained(self):
@@ -151,6 +157,49 @@ class TestTransport:
             client.disconnect()
             server.stop()
 
+    def test_wrong_response_type_is_rejected_by_reader(self):
+        server = MockViceServer()
+        server.handle(CMD_PING, lambda _: (RESP_BANKS_AVAILABLE, b"\x00\x00"))
+        server.start()
+        client = ViceBmpClient("127.0.0.1", server.port)
+        try:
+            client.connect()
+            with pytest.raises(ViceConnectionError, match="connection"):
+                client.ping()
+            assert not client.connected
+            assert "unexpected type" in str(client.terminal_error)
+        finally:
+            client.disconnect()
+            server.stop()
+
+    def test_error_type_zero_is_correlated_by_request_id(self):
+        server = MockViceServer()
+        server.handle(CMD_PING, lambda _: (0x00, b"", 0x8F))
+        server.start()
+        client = ViceBmpClient("127.0.0.1", server.port)
+        try:
+            client.connect()
+            with pytest.raises(ViceCommandError) as caught:
+                client.ping()
+            assert caught.value.error == 0x8F
+            assert caught.value.command == CMD_PING
+            assert client.connected
+        finally:
+            client.disconnect()
+            server.stop()
+
+    def test_reader_enforces_response_frame_cap_before_queue_growth(self):
+        client = ViceBmpClient()
+        client._running = True
+        client._sock = MagicMock()
+        request_id, request = client._alloc_pending(
+            CMD_PING, (RESP_PING,), RESP_PING, 1
+        )
+        client._receive_response(Frame(RESP_PING, 0, request_id, b""))
+        with pytest.raises(ViceProtocolError, match="completed"):
+            client._receive_response(Frame(RESP_PING, 0, request_id, b""))
+        assert request.response_queue.qsize() == 1
+
     def test_oversized_body_is_rejected_before_read(self):
         server = MockViceServer()
         server.start()
@@ -177,11 +226,19 @@ class TestTransport:
         client = ViceBmpClient()
         client._running = True
         client._sock = MagicMock()
-        _, first = client._alloc_pending()
-        _, second = client._alloc_pending()
+        _, first = client._alloc_pending(
+            CMD_PING, (RESP_PING,), RESP_PING, 1
+        )
+        _, second = client._alloc_pending(
+            CMD_PING, (RESP_PING,), RESP_PING, 1
+        )
         client._terminate(ViceConnectionError("fixture disconnect"))
-        assert first.get_nowait().error is client.terminal_error
-        assert second.get_nowait().error is client.terminal_error
+        assert (
+            first.response_queue.get_nowait().error is client.terminal_error
+        )
+        assert (
+            second.response_queue.get_nowait().error is client.terminal_error
+        )
 
     def test_timeout_keeps_connection_and_drains_late_response(self):
         def slow_ping(_payload):
@@ -209,10 +266,16 @@ class TestTransport:
 
     def test_partial_multichunk_write_reports_completed_range(self):
         client = ViceBmpClient()
+        cause = ViceTimeoutError(
+            "late",
+            command=0x02,
+            request_id=17,
+            state_may_have_changed=True,
+        )
         client.command = MagicMock(
             side_effect=[
                 MagicMock(request_id=1),
-                ViceTimeoutError("late", state_may_have_changed=True),
+                cause,
             ]
         )
         with pytest.raises(VicePartialWriteError) as caught:
@@ -221,6 +284,9 @@ class TestTransport:
         assert caught.value.completed_bytes == 0xFFFF
         assert caught.value.completed_ranges == ((0, 0xFFFE),)
         assert caught.value.failed_range == (0xFFFF, 0xFFFF)
+        assert caught.value.command == 0x02
+        assert caught.value.request_id == 17
+        assert caught.value.outcome_unknown is True
 
     def test_abandoned_request_limit_fails_closed(self):
         def slow_ping(_payload):

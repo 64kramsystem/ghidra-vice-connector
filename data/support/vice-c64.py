@@ -61,11 +61,11 @@ log.info("=== Agent ready, waiting for events ===")
 print("[vice-c64] Agent ready.")
 
 try:
-    # Block on the VICE receive thread — it runs until the connection drops.
-    commands.STATE.vice._recv_thread.join()
+    # Block on the one controller-owned client until the connection drops.
+    commands.STATE.require_controller().client.join()
 except KeyboardInterrupt:
     log.info("KeyboardInterrupt received")
 finally:
-    commands.STATE.vice.disconnect()
+    commands.STATE.require_controller().close()
     log.info("Disconnected")
     print("[vice-c64] Disconnected.")

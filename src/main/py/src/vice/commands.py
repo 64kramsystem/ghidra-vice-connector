@@ -29,8 +29,13 @@ from .util import (
     CPU_OP_STORE,
     ViceBmpClient,
 )
+from .controller import ViceController
 
 log = logging.getLogger('vice-agent')
+
+
+def _default_remaining_ms():
+    return 10_000
 
 # ── Trace path patterns ───────────────────────────────────────────────────────
 
@@ -68,7 +73,21 @@ class State:
         self.snap: int = 0
 
     def reset_vice(self):
-        self.vice: Optional[ViceBmpClient] = None
+        self.controller: Optional[ViceController] = None
+
+    @property
+    def vice(self):
+        """The one controller-owned client (kept as a diagnostic convenience)."""
+        return self.controller.client if self.controller is not None else None
+
+    @vice.setter
+    def vice(self, client):
+        if client is None:
+            self.controller = None
+        else:
+            self.controller = ViceController(
+                client, sync_event=sync_event, sync_result=sync_result
+            )
 
     def require_client(self) -> Client:
         if self.client is None:
@@ -80,10 +99,13 @@ class State:
             raise RuntimeError("Trace not started")
         return self.trace
 
-    def require_vice(self) -> ViceBmpClient:
-        if self.vice is None:
+    def require_controller(self) -> ViceController:
+        if self.controller is None:
             raise RuntimeError("Not connected to VICE")
-        return self.vice
+        return self.controller
+
+    def require_vice(self) -> ViceBmpClient:
+        return self.require_controller().client
 
 
 STATE = State()
@@ -115,8 +137,14 @@ def require_trace():
 # ── Connection / trace lifecycle ──────────────────────────────────────────────
 
 def connect_vice(host: str, port: int):
-    STATE.vice = ViceBmpClient(host, port)
-    STATE.vice.connect()
+    client = ViceBmpClient(host, port)
+    controller = ViceController(
+        client,
+        sync_event=sync_event,
+        sync_result=sync_result,
+    )
+    STATE.controller = controller
+    controller.connect()
 
 
 def start_trace(host: str, port: int, registry):
@@ -132,58 +160,82 @@ def start_trace(host: str, port: int, registry):
 def populate_initial_state():
     """Populate schema objects and initial register/memory snapshot."""
     log.debug("populate_initial_state() called")
-    vice = STATE.require_vice()
+    controller = STATE.require_controller()
+    vice = controller.client
     trace = STATE.require_trace()
 
-    regs = vice.registers_get()
-    pc = regs.get('PC', regs.get('pc', 0))
+    # Global order: controller operation lock, then trace lock.
+    with controller.operation_lock:
+        regs = vice.registers_get()
+        pc = regs.get('PC', regs.get('pc', 0))
+        checkpoints = vice.checkpoint_list()
+        start = max(arch.RAM_START, pc - 0x100)
+        end = min(start + 0x400 - 1, arch.RAM_END)
+        data = vice.memory_get(start, end)
 
-    log.debug(f"populate_initial_state(): PC=0x{pc:04X}, regs={regs}")
+        log.debug(f"populate_initial_state(): PC=0x{pc:04X}, regs={regs}")
 
-    # Hold TRACE_LOCK for the entire populate sequence so no event handler
-    # can interleave transactions (avoids "Unable to lock" and snap mismatch).
-    with TRACE_LOCK:
-        log.debug("populate_initial_state(): starting batch")
-        STATE.require_client().start_batch()
-        try:
-            with trace.open_tx('Stopped') as tx:
-                trace.snapshot('Initial snapshot')
-                log.debug("populate_initial_state(): skeleton")
-                _create_object_skeleton()
-                log.debug("populate_initial_state(): environment")
-                put_environment()
-                log.debug("populate_initial_state(): memory regions")
-                put_memory_regions()
-                log.debug("populate_initial_state(): registers")
-                put_registers()
-                log.debug("populate_initial_state(): breakpoints")
-                put_breakpoints()
-                # Read a small window around PC
-                start = max(arch.RAM_START, pc - 0x100)
-                end = min(start + 0x400 - 1, arch.RAM_END)
-                log.debug(f"populate_initial_state(): memory 0x{start:04X}-0x{end:04X} ({end-start+1} bytes)")
-                data = vice.memory_get(start, end)
-                trace.put_bytes(Address('RAM', start), data)
-                log.debug("populate_initial_state(): put_event_thread")
-                put_event_thread()
-        finally:
-            log.debug("populate_initial_state(): end_batch")
-            STATE.require_client().end_batch()
-        log.debug("populate_initial_state(): save")
-        trace.save()
-
-        # Disassemble and activate AFTER batch — Ghidra needs committed data first
-        snap = trace.snap()
-        log.debug(f"populate_initial_state(): current snap={snap}")
-        log.debug(f"populate_initial_state(): disassemble at Address('RAM', 0x{pc:04X}) snap={snap}")
-        with trace.open_tx('Disassemble') as tx:
-            n = trace.disassemble(Address('RAM', pc))
-        log.debug(f"populate_initial_state(): disassemble returned {n}")
-
-        log.debug(f"populate_initial_state(): activate {FRAME_PATH}")
-        with trace.open_tx('Activate') as tx:
-            trace.proxy_object_path(FRAME_PATH).activate()
+        with TRACE_LOCK:
+            _populate_initial_trace(
+                trace,
+                controller,
+                regs,
+                checkpoints,
+                start,
+                end,
+                data,
+                pc,
+            )
+    controller.start_event_coordinator(assume_stopped=True)
     log.debug("populate_initial_state(): complete")
+
+
+def _populate_initial_trace(
+    trace, controller, regs, checkpoints, start, end, data, pc
+):
+    """Commit already-observed startup state without BMP I/O under TRACE_LOCK."""
+    log.debug("populate_initial_state(): starting batch")
+    STATE.require_client().start_batch()
+    try:
+        with trace.open_tx('Stopped') as tx:
+            trace.snapshot('Initial snapshot')
+            log.debug("populate_initial_state(): skeleton")
+            _create_object_skeleton()
+            log.debug("populate_initial_state(): environment")
+            put_environment(controller.banks)
+            log.debug("populate_initial_state(): memory regions")
+            put_memory_regions()
+            log.debug("populate_initial_state(): registers")
+            put_registers(regs)
+            log.debug("populate_initial_state(): breakpoints")
+            put_breakpoints_from(checkpoints)
+            log.debug(
+                f"populate_initial_state(): memory "
+                f"0x{start:04X}-0x{end:04X} ({end-start+1} bytes)"
+            )
+            trace.put_bytes(Address('RAM', start), data)
+            log.debug("populate_initial_state(): put_event_thread")
+            put_event_thread()
+    finally:
+        log.debug("populate_initial_state(): end_batch")
+        STATE.require_client().end_batch()
+    log.debug("populate_initial_state(): save")
+    trace.save()
+
+    # Disassemble and activate AFTER batch — Ghidra needs committed data first
+    snap = trace.snap()
+    log.debug(f"populate_initial_state(): current snap={snap}")
+    log.debug(
+        f"populate_initial_state(): disassemble at "
+        f"Address('RAM', 0x{pc:04X}) snap={snap}"
+    )
+    with trace.open_tx('Disassemble') as tx:
+        n = trace.disassemble(Address('RAM', pc))
+    log.debug(f"populate_initial_state(): disassemble returned {n}")
+
+    log.debug(f"populate_initial_state(): activate {FRAME_PATH}")
+    with trace.open_tx('Activate') as tx:
+        trace.proxy_object_path(FRAME_PATH).activate()
 
 
 def _create_object_skeleton():
@@ -232,10 +284,10 @@ def _create_object_skeleton():
 
 # ── Register population ───────────────────────────────────────────────────────
 
-def put_registers():
+def put_registers(values=None):
     """Read all VICE registers and write them into the trace."""
     vice = STATE.require_vice()
-    regs = vice.registers_get()
+    regs = vice.registers_get() if values is None else values
     t = STATE.trace
     log.debug(f"put_registers(): raw regs from VICE = {regs}")
 
@@ -283,11 +335,11 @@ def put_registers():
 
 # ── Environment population ────────────────────────────────────────────────────
 
-def put_environment():
+def put_environment(banks_value=None):
     """Populate the Environment node: VICE version, connection, memory banks."""
     t = STATE.trace
     vice = STATE.require_vice()
-    version = vice.vice_info()
+    version = STATE.require_controller().vice_version or vice.vice_info()
 
     env = t.create_object(ENV_PATH)
     env.set_value('_arch', '6502')
@@ -302,7 +354,9 @@ def put_environment():
     # Banks are static per machine; memory reads always use bank 0 (the default bank),
     # so this is informational metadata. Keyed by name: VICE reuses ids (0 is both
     # 'default' and 'cpu').
-    for bank in vice.banks_available():
+    for bank in (
+        vice.banks_available() if banks_value is None else banks_value
+    ):
         obj = t.create_object(BANK_PATH.format(name=bank.name))
         obj.set_value('_display', f'{bank.name} (id {bank.id})')
         obj.set_value('id', bank.id)
@@ -363,29 +417,9 @@ def put_breakpoints():
     """Sync VICE checkpoints into the Ghidra trace breakpoint container."""
     STATE.require_vice()
     t = STATE.trace
-    checkpoints = STATE.vice.checkpoint_list()
+    checkpoints = STATE.require_vice().checkpoint_list()
     log.debug(f"put_breakpoints(): {len(checkpoints)} checkpoints")
-
-    # Retain only the current checkpoint keys — removes stale breakpoint objects
-    keys = [f'[{cp.number}]' for cp in checkpoints]
-    bps = t.create_object(BPS_PATH)
-    bps.retain_values(keys, kinds='elements')
-
-    for cp in checkpoints:
-        path = BP_PATH.format(n=cp.number)
-        obj = t.create_object(path)
-        kinds = _cpu_op_to_kinds(cp.cpu_op)
-        obj.set_value('_display',
-                      f"[{cp.number}] 0x{cp.start:04X} {kinds} "
-                      f"{'EN' if cp.enabled else 'DIS'}")
-        obj.set_value('_range',
-                      AddressRange.extend(
-                          Address('RAM', cp.start),
-                          cp.end - cp.start + 1,
-                      ))
-        obj.set_value('_enabled', cp.enabled)
-        obj.set_value('_kinds',   kinds)
-        obj.insert()
+    put_breakpoints_from(checkpoints)
 
 
 # ── Execution state helpers ───────────────────────────────────────────────────
@@ -418,12 +452,16 @@ def put_event_thread():
     log.debug("put_event_thread() complete")
 
 
-def on_stop():
+def on_stop(remaining_ms=_default_remaining_ms):
     """Called by hooks when VICE signals a stop event."""
     log.debug("on_stop() called")
     vice = STATE.require_vice()
-    regs = vice.registers_get()
+    regs = vice.registers_get(timeout_ms=remaining_ms())
     pc = regs.get('PC', regs.get('pc', 0))
+    checkpoints = vice.checkpoint_list(timeout_ms=remaining_ms())
+    start = max(arch.RAM_START, pc - 0x100)
+    end = min(start + 0x400 - 1, arch.RAM_END)
+    data = vice.memory_get(start, end, timeout_ms=remaining_ms())
     log.debug(f"on_stop(): PC=0x{pc:04X}")
 
     # Hold TRACE_LOCK for the entire stop sequence to prevent interleaving
@@ -437,13 +475,10 @@ def on_stop():
             with trace.open_tx('Stopped') as tx:
                 trace.snapshot('Stopped')
                 set_process_state_inner('STOPPED')
-                put_registers()
-                put_breakpoints()
+                put_registers(regs)
+                put_breakpoints_from(checkpoints)
                 # Read memory around PC for listing context
-                start = max(arch.RAM_START, pc - 0x100)
-                end = min(start + 0x400 - 1, arch.RAM_END)
                 log.debug(f"on_stop(): memory 0x{start:04X}-0x{end:04X}")
-                data = vice.memory_get(start, end)
                 trace.put_bytes(Address('RAM', start), data)
                 put_event_thread()
         finally:
@@ -467,8 +502,95 @@ def on_stop():
 def on_resume():
     """Called by hooks when VICE signals a resume event."""
     log.debug("on_resume() called")
-    try:
-        set_process_state('RUNNING')
-    except Exception as e:
-        log.warning(f"on_resume(): set_process_state failed (may race with step): {e}")
+    set_process_state('RUNNING')
     log.debug("on_resume() done")
+
+
+def sync_event(event, remaining_ms):
+    """Synchronize one ordered controller event into the trace."""
+    if event.kind == "stopped":
+        on_stop(remaining_ms)
+    elif event.kind == "resumed":
+        on_resume()
+    else:
+        raise ValueError(f"Unsupported controller event kind: {event.kind}")
+    snap = STATE.require_trace().snap()
+    return int(snap) if snap is not None else None
+
+
+def sync_result(kind: str, result, remaining_ms):
+    """Synchronize a completed non-execution operation while its lock is held."""
+    client = STATE.require_client()
+    trace = STATE.require_trace()
+    prepared = result
+    if kind == "reset":
+        prepared = STATE.require_vice().registers_get(
+            timeout_ms=remaining_ms()
+        )
+    elif kind.startswith("memory:") and not isinstance(result, bytes):
+        _prefix, start_text, memspace_text, bank_text = kind.split(":")
+        start = int(start_text)
+        memspace = int(memspace_text)
+        bank_id = int(bank_text)
+        ranges = result
+        if not ranges:
+            prepared = b""
+        else:
+            prepared = STATE.require_vice().memory_get(
+                start,
+                ranges[-1][1],
+                memspace,
+                bank_id,
+                timeout_ms=remaining_ms(),
+            )
+
+    with TRACE_LOCK:
+        client.start_batch()
+        try:
+            with trace.open_tx(f"VICE {kind}"):
+                if kind == "registers":
+                    put_registers(prepared)
+                elif kind == "reset":
+                    put_registers(prepared)
+                elif kind == "banks":
+                    put_environment(prepared)
+                elif kind == "checkpoints":
+                    put_breakpoints_from(prepared)
+                elif kind == "checkpoint_change":
+                    _changed, checkpoints = prepared
+                    put_breakpoints_from(checkpoints)
+                elif kind.startswith("memory:"):
+                    _prefix, start_text, memspace_text, bank_text = kind.split(":")
+                    start = int(start_text)
+                    if prepared:
+                        trace.put_bytes(Address("RAM", start), prepared)
+                else:
+                    raise ValueError(f"Unsupported trace sync kind: {kind}")
+        finally:
+            client.end_batch()
+
+
+def put_breakpoints_from(checkpoints):
+    """Write already-observed checkpoint records without another BMP request."""
+    t = STATE.require_trace()
+    keys = [f"[{cp.number}]" for cp in checkpoints]
+    bps = t.create_object(BPS_PATH)
+    bps.retain_values(keys, kinds="elements")
+    for cp in checkpoints:
+        path = BP_PATH.format(n=cp.number)
+        obj = t.create_object(path)
+        kinds = _cpu_op_to_kinds(cp.cpu_op)
+        obj.set_value(
+            "_display",
+            f"[{cp.number}] 0x{cp.start:04X} {kinds} "
+            f"{'EN' if cp.enabled else 'DIS'}",
+        )
+        obj.set_value(
+            "_range",
+            AddressRange.extend(
+                Address("RAM", cp.start), cp.end - cp.start + 1
+            ),
+        )
+        obj.set_value("_enabled", cp.enabled)
+        obj.set_value("_kinds", kinds)
+        obj.insert()

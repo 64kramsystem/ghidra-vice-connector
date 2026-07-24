@@ -14,8 +14,9 @@ from vice.protocol import (
     REQ_HDR_FMT, REQ_HDR_SIZE,
     RESP_HDR_FMT,
     EVENT_REQUEST_ID,
-    CMD_REGISTERS_AVAILABLE, CMD_PING,
-    RESP_REGISTERS_AVAILABLE, RESP_PING,
+    CMD_REGISTERS_AVAILABLE, CMD_PING, CMD_VICE_INFO, CMD_BANKS_AVAILABLE,
+    RESP_REGISTERS_AVAILABLE, RESP_PING, RESP_VICE_INFO,
+    RESP_BANKS_AVAILABLE,
 )
 
 DEFAULT_REGISTERS = [
@@ -87,6 +88,14 @@ class MockViceServer:
         self.handle(CMD_REGISTERS_AVAILABLE,
                     lambda _: (RESP_REGISTERS_AVAILABLE, reg_body))
         self.handle(CMD_PING, lambda _: (RESP_PING, b''))
+        self.handle(
+            CMD_VICE_INFO,
+            lambda _: (RESP_VICE_INFO, b'\x04\x03\x0a\x00\x00\x00'),
+        )
+        self.handle(
+            CMD_BANKS_AVAILABLE,
+            lambda _: (RESP_BANKS_AVAILABLE, struct.pack('<H', 0)),
+        )
 
     def handle(self, cmd: int, handler: Callable):
         self._handlers[cmd] = handler
@@ -154,8 +163,9 @@ class MockViceServer:
                 if handler:
                     result = handler(body)
                     # Handler may return:
-                    #   (resp_type, body)          — single frame
-                    #   [(resp_type, body), ...]   — multiple frames
+                    #   (resp_type, body)          — single success frame
+                    #   (resp_type, body, error)   — single explicit-error frame
+                    #   [(resp_type, body), ...]   — multiple success frames
                     if isinstance(result, list):
                         frames = result
                     else:
@@ -165,10 +175,15 @@ class MockViceServer:
                     frames = [(cmd, b'')]
                     error = 0x8F
 
-                for resp_type, resp_body in frames:
+                for frame in frames:
+                    if len(frame) == 3:
+                        resp_type, resp_body, frame_error = frame
+                    else:
+                        resp_type, resp_body = frame
+                        frame_error = error
                     resp_hdr = struct.pack(
                         RESP_HDR_FMT, STX, API_VERSION, len(resp_body),
-                        resp_type, error, req_id,
+                        resp_type, frame_error, req_id,
                     )
                     self._conn.sendall(resp_hdr + resp_body)
             except (OSError, ConnectionError):

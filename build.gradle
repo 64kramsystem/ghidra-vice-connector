@@ -45,4 +45,7 @@ tasks.named('buildExtension') {
     from('src/main/py/src') {
         into "${project.name}/src/main/py/src"
     }
+    from('contracts') {
+        into "${project.name}/contracts"
+    }
 }

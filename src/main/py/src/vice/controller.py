@@ -99,10 +99,18 @@ class OperationResult:
     preceding_events: Tuple[PublicEvent, ...] = ()
 
 
-SyncEvent = Callable[[RawEvent], Optional[int]]
+RemainingMs = Callable[[], int]
+SyncEvent = Callable[[RawEvent, RemainingMs], Optional[int]]
+SyncResult = Callable[[str, object, RemainingMs], None]
 
 
-def _no_sync(_event: RawEvent) -> Optional[int]:
+def _no_sync(_event: RawEvent, _remaining_ms: RemainingMs) -> Optional[int]:
+    return None
+
+
+def _no_result_sync(
+    _kind: str, _result: object, _remaining_ms: RemainingMs
+) -> None:
     return None
 
 
@@ -114,6 +122,7 @@ class ViceController:
         client: ViceBmpClient,
         *,
         sync_event: Optional[SyncEvent] = None,
+        sync_result: Optional[SyncResult] = None,
         event_history_limit: int = EVENT_HISTORY_LIMIT,
     ):
         if event_history_limit < 1:
@@ -127,6 +136,7 @@ class ViceController:
             maxlen=event_history_limit
         )
         self._sync_event = sync_event or _no_sync
+        self._sync_result = sync_result or _no_result_sync
         self._public_sequence = 0
         self._command_sequence = 0
         self._last_raw_sequence = 0
@@ -139,6 +149,8 @@ class ViceController:
         self._coordinator_stop = False
         self._coordinator: Optional[threading.Thread] = None
         self._events_enabled = False
+        self.vice_version: Optional[str] = None
+        self.banks: Tuple[Bank, ...] = ()
         client.set_event_callback(self._on_raw_event)
         client.set_terminal_callback(self._on_terminal)
 
@@ -178,7 +190,13 @@ class ViceController:
             self._terminal_error = None
             self._connection_state = "disconnected"
             self._execution_state = "unknown"
-        self.client.connect(discover_registers=discover_registers)
+        try:
+            self.client.connect(discover_registers=discover_registers)
+            self.vice_version = self.client.vice_info()
+            self.banks = tuple(self.client.banks_available())
+        except BaseException:
+            self.client.disconnect()
+            raise
         with self._condition:
             self._connection_state = "connected"
             self._condition.notify_all()
@@ -282,11 +300,20 @@ class ViceController:
             return self._raw_events.popleft()
 
     def _publish(
-        self, event: RawEvent, *, action_applied: bool = False
+        self,
+        event: RawEvent,
+        *,
+        action_applied: bool = False,
+        deadline: Optional[float] = None,
     ) -> PublicEvent:
+        sync_deadline = (
+            time.monotonic() + 10.0 if deadline is None else deadline
+        )
         try:
-            snapshot = self._sync_event(event)
-        except ViceFailure:
+            snapshot = self._sync_event(
+                event, lambda: self._remaining_ms(sync_deadline)
+            )
+        except ViceTraceSyncError:
             raise
         except BaseException as exc:
             raise ViceTraceSyncError(
@@ -328,13 +355,15 @@ class ViceController:
             self._condition.notify_all()
             return public
 
-    def _drain_pending(self) -> List[PublicEvent]:
+    def _drain_pending(
+        self, deadline: Optional[float] = None
+    ) -> List[PublicEvent]:
         result = []
         while True:
             event = self._pop_raw(None, require=False)
             if event is None:
                 return result
-            result.append(self._publish(event))
+            result.append(self._publish(event, deadline=deadline))
 
     def _coordinate_unsolicited(self) -> None:
         while True:
@@ -384,16 +413,27 @@ class ViceController:
         deadline = time.monotonic() + timeout_ms / 1000.0
         with self.operation_lock:
             # These events predate this operation, so its action was not applied.
-            preceding = self._drain_pending()
+            preceding = self._drain_pending(deadline)
             if precondition == "running":
                 self._require_running()
             else:
                 self._require_stopped()
             watermark = self._raw_watermark()
             sequence = self._next_command_sequence()
+            remaining = self._remaining_ms(deadline)
             with self._condition:
                 self._execution_state = "transitioning"
-            request_id = acknowledge(self._remaining_ms(deadline))
+            try:
+                request_id = acknowledge(remaining)
+            except ViceFailure as exc:
+                # A rejected or locally invalid command did not change VICE
+                # execution. Timeouts and transport failures remain unknown.
+                if not exc.outcome_unknown:
+                    with self._condition:
+                        if self._connection_state == "connected":
+                            self._execution_state = precondition
+                            self._condition.notify_all()
+                raise
             matched = 0
             checkpoint_stop: Optional[PublicEvent] = None
             last: Optional[PublicEvent] = None
@@ -403,17 +443,23 @@ class ViceController:
                     assert raw is not None
                     if raw.raw_sequence <= watermark:
                         # Below-watermark events predate the acknowledged action.
-                        preceding.append(self._publish(raw))
+                        preceding.append(
+                            self._publish(raw, deadline=deadline)
+                        )
                         continue
                     expected = pattern[matched]
                     if raw.kind == expected and not (
                         interrupt and raw.kind == "stopped"
                         and raw.checkpoint is not None
                     ):
-                        last = self._publish(raw, action_applied=True)
+                        last = self._publish(
+                            raw, action_applied=True, deadline=deadline
+                        )
                         matched += 1
                     else:
-                        published = self._publish(raw, action_applied=True)
+                        published = self._publish(
+                            raw, action_applied=True, deadline=deadline
+                        )
                         preceding.append(published)
                         if (
                             interrupt
@@ -475,20 +521,72 @@ class ViceController:
             interrupt=True,
         )
 
-    def _stopped_call(self, callback):
+    def _stopped_call(
+        self,
+        callback,
+        *,
+        timeout_ms: int,
+        sync_kind: Optional[str] = None,
+    ):
+        if not 1 <= timeout_ms <= 55_000:
+            raise ViceValidationError("timeout_ms must be in 1..55000")
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        remaining_ms = lambda: self._remaining_ms(deadline)
         with self.operation_lock:
-            self._drain_pending()
+            self._drain_pending(deadline)
             self._require_stopped()
             sequence = self._next_command_sequence()
-            return sequence, callback()
+            result = callback(remaining_ms)
+            if sync_kind is not None:
+                try:
+                    self._sync_result(sync_kind, result, remaining_ms)
+                except ViceTraceSyncError:
+                    raise
+                except BaseException as exc:
+                    raise ViceTraceSyncError(
+                        f"trace synchronization failed for {sync_kind}: {exc}",
+                        event=RawEvent(
+                            self._last_raw_sequence,
+                            sync_kind,
+                            0,
+                            None,
+                            None,
+                            b"",
+                            time.monotonic(),
+                        ),
+                        action_applied=True,
+                        cause=exc,
+                    ) from exc
+            return sequence, result
+
+    def _post_action_sync_error(
+        self, sync_kind: str, cause: BaseException
+    ) -> ViceTraceSyncError:
+        raw_sequence = self._raw_watermark()
+        return ViceTraceSyncError(
+            f"trace synchronization failed for {sync_kind}: {cause}",
+            event=RawEvent(
+                raw_sequence,
+                sync_kind,
+                0,
+                None,
+                None,
+                b"",
+                time.monotonic(),
+            ),
+            action_applied=True,
+            cause=cause,
+        )
 
     def get_registers(
         self, memspace: int = MEMSPACE_MAIN, *, timeout_ms: int = 10_000
     ) -> Tuple[int, Dict[str, int]]:
         return self._stopped_call(
-            lambda: self.client.registers_get(
-                memspace, timeout_ms=timeout_ms
-            )
+            lambda remaining: self.client.registers_get(
+                memspace, timeout_ms=remaining()
+            ),
+            timeout_ms=timeout_ms,
+            sync_kind="registers",
         )
 
     def set_registers(
@@ -499,16 +597,23 @@ class ViceController:
         timeout_ms: int = 10_000,
     ) -> Tuple[int, Dict[str, int]]:
         return self._stopped_call(
-            lambda: self.client.registers_set(
-                values, memspace, timeout_ms=timeout_ms
-            )
+            lambda remaining: self.client.registers_set(
+                values, memspace, timeout_ms=remaining()
+            ),
+            timeout_ms=timeout_ms,
+            sync_kind="registers",
         )
 
     def list_banks(
         self, *, timeout_ms: int = 10_000
     ) -> Tuple[int, List[Bank]]:
+        def list_and_cache(remaining):
+            result = self.client.banks_available(timeout_ms=remaining())
+            self.banks = tuple(result)
+            return result
+
         return self._stopped_call(
-            lambda: self.client.banks_available(timeout_ms=timeout_ms)
+            list_and_cache, timeout_ms=timeout_ms, sync_kind="banks"
         )
 
     def read_memory(
@@ -520,16 +625,22 @@ class ViceController:
         bank_id: int = 0,
         side_effects: bool = False,
         timeout_ms: int = 10_000,
+        sync_trace: bool = False,
     ) -> Tuple[int, bytes]:
         return self._stopped_call(
-            lambda: self.client.memory_get(
+            lambda remaining: self.client.memory_get(
                 start,
                 end,
                 memspace,
                 bank_id,
                 side_effects,
-                timeout_ms=timeout_ms,
-            )
+                timeout_ms=remaining(),
+            ),
+            timeout_ms=timeout_ms,
+            sync_kind=(
+                f"memory:{start}:{memspace}:{bank_id}"
+                if sync_trace else None
+            ),
         )
 
     def write_memory(
@@ -541,23 +652,33 @@ class ViceController:
         bank_id: int = 0,
         side_effects: bool = False,
         timeout_ms: int = 10_000,
+        sync_trace: bool = True,
     ) -> Tuple[int, List[Tuple[int, int]]]:
         return self._stopped_call(
-            lambda: self.client.memory_set(
+            lambda remaining: self.client.memory_set(
                 start,
                 data,
                 memspace,
                 bank_id,
                 side_effects,
-                timeout_ms=timeout_ms,
-            )
+                timeout_ms=remaining(),
+            ),
+            timeout_ms=timeout_ms,
+            sync_kind=(
+                f"memory:{start}:{memspace}:{bank_id}"
+                if sync_trace else None
+            ),
         )
 
     def list_checkpoints(
         self, *, timeout_ms: int = 10_000
     ) -> Tuple[int, List[Checkpoint]]:
         return self._stopped_call(
-            lambda: self.client.checkpoint_list(timeout_ms=timeout_ms)
+            lambda remaining: self.client.checkpoint_list(
+                timeout_ms=remaining()
+            ),
+            timeout_ms=timeout_ms,
+            sync_kind="checkpoints",
         )
 
     def set_checkpoint(
@@ -571,9 +692,9 @@ class ViceController:
         temporary: bool = False,
         memspace: int = MEMSPACE_MAIN,
         timeout_ms: int = 10_000,
-    ) -> Tuple[int, Checkpoint]:
-        return self._stopped_call(
-            lambda: self.client.checkpoint_set(
+    ) -> Tuple[int, Tuple[Checkpoint, List[Checkpoint]]]:
+        def create_and_list(remaining):
+            checkpoint = self.client.checkpoint_set(
                 start,
                 end,
                 stop_on_hit,
@@ -581,33 +702,73 @@ class ViceController:
                 cpu_op,
                 temporary,
                 memspace,
-                timeout_ms=timeout_ms,
+                timeout_ms=remaining(),
             )
+            try:
+                checkpoints = self.client.checkpoint_list(
+                    timeout_ms=remaining()
+                )
+            except BaseException as exc:
+                raise self._post_action_sync_error(
+                    "checkpoint_change", exc
+                ) from exc
+            return checkpoint, checkpoints
+
+        return self._stopped_call(
+            create_and_list,
+            timeout_ms=timeout_ms,
+            sync_kind="checkpoint_change",
         )
 
     def delete_checkpoint(
         self, number: int, *, timeout_ms: int = 10_000
-    ) -> Tuple[int, None]:
-        return self._stopped_call(
-            lambda: self.client.checkpoint_delete(
-                number, timeout_ms=timeout_ms
+    ) -> Tuple[int, List[Checkpoint]]:
+        def delete_and_list(remaining):
+            self.client.checkpoint_delete(
+                number, timeout_ms=remaining()
             )
+            try:
+                return self.client.checkpoint_list(timeout_ms=remaining())
+            except BaseException as exc:
+                raise self._post_action_sync_error(
+                    "checkpoints", exc
+                ) from exc
+
+        return self._stopped_call(
+            delete_and_list,
+            timeout_ms=timeout_ms,
+            sync_kind="checkpoints",
         )
 
     def toggle_checkpoint(
         self, number: int, enabled: bool, *, timeout_ms: int = 10_000
-    ) -> Tuple[int, None]:
-        return self._stopped_call(
-            lambda: self.client.checkpoint_toggle(
-                number, enabled, timeout_ms=timeout_ms
+    ) -> Tuple[int, List[Checkpoint]]:
+        def toggle_and_list(remaining):
+            self.client.checkpoint_toggle(
+                number, enabled, timeout_ms=remaining()
             )
+            try:
+                return self.client.checkpoint_list(timeout_ms=remaining())
+            except BaseException as exc:
+                raise self._post_action_sync_error(
+                    "checkpoints", exc
+                ) from exc
+
+        return self._stopped_call(
+            toggle_and_list,
+            timeout_ms=timeout_ms,
+            sync_kind="checkpoints",
         )
 
     def reset(
         self, reset_type: int, *, timeout_ms: int = 10_000
     ) -> Tuple[int, None]:
         return self._stopped_call(
-            lambda: self.client.reset(reset_type, timeout_ms=timeout_ms)
+            lambda remaining: self.client.reset(
+                reset_type, timeout_ms=remaining()
+            ),
+            timeout_ms=timeout_ms,
+            sync_kind="reset",
         )
 
     def status(self) -> Dict[str, object]:

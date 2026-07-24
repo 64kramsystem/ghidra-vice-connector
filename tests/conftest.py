@@ -11,6 +11,7 @@ Provides:
 
 import os
 import sys
+from dataclasses import dataclass
 from typing import Callable, Dict
 from unittest.mock import MagicMock
 
@@ -69,9 +70,9 @@ def _build_ghidratrace_stubs():
         def __init__(self, executor=None):
             self.methods = {}
 
-        def method(self, action=None, display=None):
+        def method(self, name=None, action=None, display=None, **_kwargs):
             def decorator(fn):
-                self.methods[fn.__name__] = fn
+                self.methods[name or fn.__name__] = fn
                 return fn
             return decorator
 
@@ -90,13 +91,19 @@ def _build_ghidratrace_stubs():
         def __init__(self):
             self.path = ''
 
+    @dataclass(frozen=True)
+    class _ParamDesc:
+        display: str = ""
+        schema: object = None
+        description: str = ""
+
     client_mod.Address = _Address
     client_mod.AddressRange = _AddressRange
     client_mod.RegVal = _RegVal
     client_mod.TraceObject = _TraceObject
     client_mod.MethodRegistry = _MethodRegistry
     client_mod.Client = MagicMock(name='Client')
-    client_mod.ParamDesc = MagicMock(name='ParamDesc')
+    client_mod.ParamDesc = _ParamDesc
 
     # ghidratrace (top-level)
     ghidratrace_mod = MagicMock(name='ghidratrace')

@@ -15,7 +15,7 @@ import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 log = logging.getLogger("vice-agent")
@@ -148,7 +148,12 @@ class VicePartialWriteError(ViceFailure):
         self.failed_range = failed_range
         self.partial = bool(completed_ranges)
         self.memory_may_be_modified = bool(completed_ranges)
-        super().__init__(message, outcome_unknown=True)
+        super().__init__(
+            message,
+            command=getattr(cause, "command", None),
+            request_id=getattr(cause, "request_id", None),
+            outcome_unknown=getattr(cause, "outcome_unknown", True),
+        )
         self.__cause__ = cause
 
 
@@ -225,6 +230,22 @@ class _AbandonedRequest:
     terminal_response: int
     max_frames: int
     frames_seen: int = 0
+
+
+@dataclass
+class _PendingRequest:
+    command: int
+    expected: frozenset[int]
+    terminal_response: int
+    max_frames: int
+    response_queue: queue.Queue = field(init=False)
+    frames_seen: int = 0
+    terminal_seen: bool = False
+
+    def __post_init__(self) -> None:
+        # Reserve one slot for a terminal connection error even when every
+        # permitted response frame is already buffered.
+        self.response_queue = queue.Queue(maxsize=self.max_frames + 1)
 
 
 class Cursor:
@@ -317,6 +338,12 @@ def _validate_id(value: int, field: str, maximum: int = 0xFFFF) -> int:
     return value
 
 
+def _validate_bool(value: bool, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ViceValidationError(f"{field} must be a boolean")
+    return value
+
+
 class ViceBmpClient:
     """One-connection, one-reader, request-correlating BMP client."""
 
@@ -342,7 +369,7 @@ class ViceBmpClient:
         self._sock: Optional[socket.socket] = None
         self._send_lock = threading.Lock()
         self._state_lock = threading.RLock()
-        self._pending: Dict[int, queue.Queue] = {}
+        self._pending: Dict[int, _PendingRequest] = {}
         self._abandoned: Dict[int, _AbandonedRequest] = {}
         self._next_id = 1
         self._running = False
@@ -428,7 +455,7 @@ class ViceBmpClient:
     def _terminate(self, error: ViceConnectionError) -> None:
         callback = None
         sock = None
-        pending: List[queue.Queue] = []
+        pending: List[_PendingRequest] = []
         with self._state_lock:
             if self._terminal_error is not None:
                 return
@@ -449,15 +476,23 @@ class ViceBmpClient:
             except OSError:
                 pass
         terminal = _Terminal(error)
-        for response_queue in pending:
-            response_queue.put_nowait(terminal)
+        for request in pending:
+            request.response_queue.put_nowait(terminal)
         if callback is not None:
             try:
                 callback(error)
             except BaseException:
                 log.exception("VICE terminal callback failed")
 
-    def _alloc_pending(self) -> Tuple[int, queue.Queue]:
+    def _alloc_pending(
+        self,
+        command: int,
+        expected: Sequence[int],
+        terminal_response: int,
+        max_frames: int,
+    ) -> Tuple[int, _PendingRequest]:
+        if max_frames < 1:
+            raise ValueError("max_frames must be positive")
         with self._state_lock:
             if not self._running or self._sock is None:
                 raise self._terminal_error or ViceConnectionError(
@@ -479,9 +514,14 @@ class ViceBmpClient:
                     request_id not in self._pending
                     and request_id not in self._abandoned
                 ):
-                    response_queue: queue.Queue = queue.Queue()
-                    self._pending[request_id] = response_queue
-                    return request_id, response_queue
+                    request = _PendingRequest(
+                        command,
+                        frozenset(expected),
+                        terminal_response,
+                        max_frames,
+                    )
+                    self._pending[request_id] = request
+                    return request_id, request
         raise ViceProtocolError("all VICE request IDs are in use")
 
     def _send_raw(self, command: int, payload: bytes, request_id: int) -> None:
@@ -557,13 +597,37 @@ class ViceBmpClient:
 
     def _receive_response(self, frame: Frame) -> None:
         with self._state_lock:
-            response_queue = self._pending.get(frame.request_id)
+            request = self._pending.get(frame.request_id)
             abandoned = self._abandoned.get(frame.request_id)
             if abandoned is not None:
                 self._discard_abandoned_frame_locked(frame, abandoned)
                 return
-            if response_queue is not None:
-                response_queue.put_nowait(frame)
+            if request is not None:
+                if request.terminal_seen:
+                    raise ViceProtocolError(
+                        f"response for completed VICE request ID "
+                        f"{frame.request_id}"
+                    )
+                # VICE emits response type 0x00 for some command failures.
+                # The matching request ID still correlates that frame; only
+                # successful responses must have the declared response type.
+                if not frame.error and frame.response_type not in request.expected:
+                    raise ViceProtocolError(
+                        f"response for command 0x{request.command:02x} "
+                        f"request {frame.request_id} has unexpected type "
+                        f"0x{frame.response_type:02x}"
+                    )
+                request.frames_seen += 1
+                if request.frames_seen > request.max_frames:
+                    raise ViceProtocolError(
+                        f"response for request {frame.request_id} exceeded "
+                        f"{request.max_frames} frames"
+                    )
+                request.terminal_seen = bool(
+                    frame.error
+                    or frame.response_type == request.terminal_response
+                )
+                request.response_queue.put_nowait(frame)
                 return
             raise ViceProtocolError(
                 f"response for unknown VICE request ID {frame.request_id}"
@@ -572,7 +636,7 @@ class ViceBmpClient:
     def _discard_abandoned_frame_locked(
         self, frame: Frame, abandoned: _AbandonedRequest
     ) -> None:
-        if frame.response_type not in abandoned.expected:
+        if not frame.error and frame.response_type not in abandoned.expected:
             raise ViceProtocolError(
                 f"late response for command 0x{abandoned.command:02x} "
                 f"request {frame.request_id} has unexpected type "
@@ -651,7 +715,10 @@ class ViceBmpClient:
     ) -> Tuple[int, List[Frame]]:
         if not 1 <= timeout_ms <= 55_000:
             raise ViceValidationError("timeout_ms must be in 1..55000")
-        request_id, response_queue = self._alloc_pending()
+        request_id, request = self._alloc_pending(
+            command, expected, terminal_response, max_frames
+        )
+        response_queue = request.response_queue
         timed_out = False
         try:
             self._send_raw(command, payload, request_id)
@@ -693,24 +760,14 @@ class ViceBmpClient:
                     timed_out = False
                     raise self._terminal_error
                 self._pending.pop(request_id, None)
-                abandoned = _AbandonedRequest(
-                    command,
-                    frozenset(expected),
-                    terminal_response,
-                    max_frames,
-                )
-                self._abandoned[request_id] = abandoned
-                while True:
-                    try:
-                        late_item = response_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if isinstance(late_item, Frame):
-                        self._discard_abandoned_frame_locked(
-                            late_item, abandoned
-                        )
-                    if request_id not in self._abandoned:
-                        break
+                if not request.terminal_seen:
+                    self._abandoned[request_id] = _AbandonedRequest(
+                        command,
+                        frozenset(expected),
+                        terminal_response,
+                        max_frames,
+                        frames_seen=request.frames_seen,
+                    )
             timeout = ViceTimeoutError(
                 f"VICE command 0x{command:02x} timed out after {timeout_ms} ms",
                 command=command,
@@ -901,6 +958,7 @@ class ViceBmpClient:
             raise ViceValidationError("memory range must not wrap")
         _validate_id(memspace, "memspace", 0xFF)
         _validate_id(bank_id, "bank_id")
+        _validate_bool(side_effects, "side_effects")
         result = bytearray()
         cursor = start
         while cursor <= end:
@@ -918,6 +976,7 @@ class ViceBmpClient:
                 payload,
                 expected=RESP_MEMORY_GET,
                 timeout_ms=timeout_ms,
+                mutating=bool(side_effects),
             )
             body = Cursor(frame.body, "memory get")
             length = body.u16()
@@ -949,6 +1008,7 @@ class ViceBmpClient:
             raise ViceValidationError("memory write must fit without wrapping")
         _validate_id(memspace, "memspace", 0xFF)
         _validate_id(bank_id, "bank_id")
+        _validate_bool(side_effects, "side_effects")
         completed = []
         offset = 0
         while offset < len(data):
@@ -1003,6 +1063,9 @@ class ViceBmpClient:
         if not cpu_op or cpu_op & ~(CPU_OP_LOAD | CPU_OP_STORE | CPU_OP_EXEC):
             raise ViceValidationError("cpu_op must contain only load/store/execute")
         _validate_id(memspace, "memspace", 0xFF)
+        _validate_bool(stop_on_hit, "stop_on_hit")
+        _validate_bool(enabled, "enabled")
+        _validate_bool(temporary, "temporary")
         payload = struct.pack(
             "<HHBBBBB",
             start,
@@ -1038,6 +1101,7 @@ class ViceBmpClient:
         self, number: int, enabled: bool, *, timeout_ms: int = 10_000
     ) -> None:
         _validate_id(number, "checkpoint number", 0xFFFFFFFF)
+        _validate_bool(enabled, "enabled")
         self.command(
             CMD_CHECKPOINT_TOGGLE,
             struct.pack("<IB", number, int(bool(enabled))),
@@ -1085,6 +1149,7 @@ class ViceBmpClient:
             raise ViceProtocolError(f"bank count {count} exceeds {MAX_LIST_ITEMS}")
         result = []
         pairs = set()
+        names = set()
         for index in range(count):
             item_size = cur.u8()
             item = Cursor(cur.take(item_size), f"bank item {index}")
@@ -1099,9 +1164,10 @@ class ViceBmpClient:
                     f"bank item {index}: name is not ASCII"
                 ) from exc
             pair = (bank_id, name)
-            if not name or pair in pairs:
+            if not name or pair in pairs or name in names:
                 raise ViceProtocolError(f"duplicate or empty bank item {index}")
             pairs.add(pair)
+            names.add(name)
             result.append(Bank(bank_id, name))
         cur.finish()
         return result
@@ -1129,6 +1195,7 @@ class ViceBmpClient:
     ) -> int:
         if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 0xFFFF:
             raise ViceValidationError("count must be in 1..65535")
+        _validate_bool(step_over, "step_over")
         frame = self.command(
             CMD_ADVANCE_INSTRUCTIONS,
             struct.pack("<BH", int(bool(step_over)), count),

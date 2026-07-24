@@ -10,6 +10,11 @@ A Ghidra debugger extension that connects to the [VICE](https://vice-emu.sourcef
 - Breakpoints (execute) and watchpoints (read/write)
 - Automatic disassembly around the program counter on stop events
 - Soft and hard reset
+- A versioned `c64.vice/1.0` TraceRMI automation API for MCP and other clients
+- Bank-aware memory, dynamic register metadata, and checkpoint automation
+
+The Ghidra UI and automation API share one serialized controller and one VICE
+binary-monitor socket. Automation never opens a second emulator connection.
 
 ## Prerequisites
 
@@ -58,12 +63,14 @@ The VICE binary monitor is an unauthenticated TCP control channel over the emula
 
 ```
 src/main/java/       Stub Java class (required by the Ghidra extension build)
-pypkg/src/vice/      Python TraceRmi agent
+src/main/py/src/vice/ Python TraceRmi agent
   arch.py            Architecture constants (6502 language, registers, memory map)
   commands.py        Trace population — reads state from VICE, writes to Ghidra trace
-  methods.py         Remote methods — Ghidra UI actions (step, resume, breakpoints, …)
-  hooks.py           Event handlers for VICE stop/resume notifications
-  util.py            VICE Binary Monitor Protocol client
+  controller.py      Serialized operations and ordered execution-event history
+  protocol.py        Strict VICE Binary Monitor Protocol client
+  automation.py      Versioned C64 automation remote methods
+  contracts.py       Declarative automation capability/method contract
+  methods.py         Ghidra UI remote methods sharing the same controller
 data/
   debugger-launchers/  Shell launcher and TraceRmi schema
   support/             Python entry point (vice-c64.py)
@@ -113,4 +120,4 @@ CI (`.github/workflows/build.yml`) resolves the latest Ghidra **12.1** release, 
 
 ## License
 
-See the repository for license information.
+Apache-2.0. `NOTICE` records the original project and authorized relicensing.

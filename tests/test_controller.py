@@ -18,6 +18,7 @@ from vice.protocol import (
     RESP_STOPPED,
     ViceConnectionError,
     ViceTimeoutError,
+    ViceValidationError,
 )
 
 
@@ -49,6 +50,12 @@ class FakeClient:
 
     def connect(self, discover_registers=True):
         self.connected = True
+
+    def vice_info(self):
+        return "3.10.0"
+
+    def banks_available(self, timeout_ms=10_000):
+        return []
 
     def disconnect(self):
         if not self.connected:
@@ -105,7 +112,9 @@ class TestControllerOrdering:
     def test_step_publishes_resume_then_stop_in_raw_order(self):
         synchronized = []
         client, controller = connected_controller(
-            sync=lambda event: synchronized.append(event.kind) or len(synchronized)
+            sync=lambda event, _remaining: (
+                synchronized.append(event.kind) or len(synchronized)
+            )
         )
         client.next_events = [raw(1, "resumed"), raw(2, "stopped")]
         result = controller.step(timeout_ms=1_000)
@@ -154,8 +163,70 @@ class TestControllerOrdering:
         assert [event.raw_sequence for event in controller.history] == [1, 2]
         controller.close()
 
+    def test_result_sync_runs_under_operation_lock(self):
+        client = FakeClient()
+        observed = []
+        controller = ViceController(client)
+        controller._sync_result = lambda kind, result, _remaining: observed.append(
+            (kind, result, controller.operation_lock._is_owned())
+        )
+        controller.connect(discover_registers=False)
+        controller.start_event_coordinator(assume_stopped=True)
+        controller.get_registers()
+        assert observed == [("registers", {"PC": 0x1234}, True)]
+        controller.close()
+
+    def test_high_level_operations_do_not_overlap(self):
+        client, controller = connected_controller()
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+
+        def registers_get(memspace, timeout_ms):
+            nonlocal active, maximum
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            time.sleep(0.02)
+            with guard:
+                active -= 1
+            return {"PC": 0x1234}
+
+        client.registers_get = registers_get
+        threads = [
+            threading.Thread(target=controller.get_registers)
+            for _ in range(4)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(1)
+        assert maximum == 1
+        controller.close()
+
 
 class TestControllerFailures:
+    def test_capability_discovery_failure_closes_client(self):
+        client = FakeClient()
+        client.vice_info = MagicMock(
+            side_effect=ViceValidationError("bad VICE info")
+        )
+        controller = ViceController(client)
+        with pytest.raises(ViceValidationError, match="bad VICE info"):
+            controller.connect(discover_registers=False)
+        assert client.connected is False
+        assert controller.connection_state == "disconnected"
+
+    def test_rejected_ack_restores_pre_action_execution_state(self):
+        client, controller = connected_controller()
+        client.acknowledge_step = MagicMock(
+            side_effect=ViceValidationError("bad count")
+        )
+        with pytest.raises(ViceValidationError, match="bad count"):
+            controller.step(timeout_ms=1_000)
+        assert controller.execution_state == "stopped"
+        controller.close()
+
     def test_connection_loss_wakes_public_waiter(self):
         client, controller = connected_controller()
         result = {}
@@ -185,6 +256,21 @@ class TestControllerFailures:
         assert controller.execution_state == "stopped"
         controller.close()
 
+    def test_checkpoint_then_interrupt_stop_succeeds_in_order(self):
+        client, controller = connected_controller()
+        with controller._condition:
+            controller._execution_state = "running"
+        checkpoint = Checkpoint(7, 0x1000, 0x1000, currently_hit=True)
+        client.next_events = [
+            raw(1, "stopped", checkpoint=checkpoint),
+            raw(2, "stopped", pc=0x2000),
+        ]
+        result = controller.interrupt(timeout_ms=100)
+        assert result.event.raw_sequence == 2
+        assert result.preceding_events[-1].checkpoint.number == 7
+        assert [event.raw_sequence for event in controller.history] == [1, 2]
+        controller.close()
+
     def test_history_loss_boundary(self):
         client, controller = connected_controller(history=2)
         with controller.operation_lock:
@@ -198,7 +284,7 @@ class TestControllerFailures:
         controller.close()
 
     def test_sync_failure_does_not_publish_event(self):
-        def fail_sync(_event):
+        def fail_sync(_event, _remaining):
             raise RuntimeError("trace unavailable")
 
         client, controller = connected_controller(sync=fail_sync)
@@ -207,6 +293,102 @@ class TestControllerFailures:
             controller.step(timeout_ms=1_000)
         assert caught.value.action_applied is True
         assert controller.history == ()
+        controller.close()
+
+    def test_vice_failure_during_event_sync_is_trace_sync_failure(self):
+        def fail_sync(_event, _remaining):
+            raise ViceTimeoutError("refresh timed out")
+
+        client, controller = connected_controller(sync=fail_sync)
+        client.next_events = [raw(1, "resumed")]
+        with pytest.raises(ViceTraceSyncError) as caught:
+            controller.resume(timeout_ms=1_000)
+        assert caught.value.action_applied is True
+        assert caught.value.trace_sync_failed is True
+        assert controller.history == ()
+        controller.close()
+
+    def test_vice_failure_during_result_sync_is_trace_sync_failure(self):
+        client, controller = connected_controller()
+        controller._sync_result = MagicMock(
+            side_effect=ViceTimeoutError("trace refresh timed out")
+        )
+        with pytest.raises(ViceTraceSyncError) as caught:
+            controller.get_registers(timeout_ms=1_000)
+        assert caught.value.action_applied is True
+        assert caught.value.trace_sync_failed is True
+        controller.close()
+
+    def test_composite_checkpoint_calls_share_one_timeout_budget(self):
+        client, controller = connected_controller()
+        budgets = []
+
+        def checkpoint_set(*_args, timeout_ms, **_kwargs):
+            budgets.append(timeout_ms)
+            time.sleep(0.02)
+            return Checkpoint(1, 0x1000, 0x1000)
+
+        def checkpoint_list(*, timeout_ms):
+            budgets.append(timeout_ms)
+            return []
+
+        client.checkpoint_set = checkpoint_set
+        client.checkpoint_list = checkpoint_list
+        controller.set_checkpoint(0x1000, 0x1000, timeout_ms=500)
+        assert len(budgets) == 2
+        assert 1 <= budgets[1] < budgets[0] <= 500
+        controller.close()
+
+    def test_checkpoint_refresh_failure_reports_applied_mutation(self):
+        client, controller = connected_controller()
+        client.checkpoint_set = MagicMock(
+            return_value=Checkpoint(1, 0x1000, 0x1000)
+        )
+        client.checkpoint_list = MagicMock(
+            side_effect=ViceTimeoutError("list timed out")
+        )
+        with pytest.raises(ViceTraceSyncError) as caught:
+            controller.set_checkpoint(0x1000, 0x1000, timeout_ms=500)
+        assert caught.value.action_applied is True
+        assert caught.value.trace_sync_failed is True
+        assert isinstance(caught.value.__cause__, ViceTimeoutError)
+        controller.close()
+
+    @pytest.mark.parametrize(
+        ("method", "arguments", "client_method"),
+        [
+            ("delete_checkpoint", (1,), "checkpoint_delete"),
+            ("toggle_checkpoint", (1, False), "checkpoint_toggle"),
+        ],
+    )
+    def test_other_checkpoint_refresh_failures_report_applied_mutation(
+        self, method, arguments, client_method
+    ):
+        client, controller = connected_controller()
+        setattr(client, client_method, MagicMock(return_value=None))
+        client.checkpoint_list = MagicMock(
+            side_effect=ViceTimeoutError("list timed out")
+        )
+        with pytest.raises(ViceTraceSyncError) as caught:
+            getattr(controller, method)(*arguments, timeout_ms=500)
+        assert caught.value.action_applied is True
+        assert caught.value.trace_sync_failed is True
+        assert isinstance(caught.value.__cause__, ViceTimeoutError)
+        controller.close()
+
+    def test_budget_exhaustion_after_checkpoint_mutation_is_sync_failure(self):
+        client, controller = connected_controller()
+
+        def checkpoint_set(*_args, timeout_ms, **_kwargs):
+            time.sleep(0.02)
+            return Checkpoint(1, 0x1000, 0x1000)
+
+        client.checkpoint_set = checkpoint_set
+        client.checkpoint_list = MagicMock()
+        with pytest.raises(ViceTraceSyncError) as caught:
+            controller.set_checkpoint(0x1000, 0x1000, timeout_ms=10)
+        assert caught.value.action_applied is True
+        client.checkpoint_list.assert_not_called()
         controller.close()
 
     def test_raw_sequence_regression_aborts_client_and_coordinator(self):
@@ -224,3 +406,33 @@ class TestControllerFailures:
             ViceController._remaining_ms(time.monotonic() - 1)
         assert caught.value.outcome_unknown is True
         assert caught.value.state_may_have_changed is False
+
+    def test_running_data_read_sends_no_protocol_frame(self):
+        client, controller = connected_controller()
+        with controller._condition:
+            controller._execution_state = "running"
+        with pytest.raises(ViceStateError):
+            controller.get_registers()
+        assert client.calls == []
+        controller.close()
+
+    def test_connection_loss_wakes_causal_event_waiter(self):
+        client, controller = connected_controller()
+        with controller._condition:
+            controller._execution_state = "running"
+        result = {}
+
+        def run_interrupt():
+            try:
+                controller.interrupt(timeout_ms=10_000)
+            except BaseException as error:
+                result["error"] = error
+
+        thread = threading.Thread(target=run_interrupt)
+        thread.start()
+        deadline = time.monotonic() + 1
+        while not client.calls and time.monotonic() < deadline:
+            time.sleep(0.005)
+        client.fail()
+        thread.join(0.5)
+        assert isinstance(result["error"], ViceConnectionError)
