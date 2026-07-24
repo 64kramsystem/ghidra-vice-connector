@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Callable, Dict, Optional
 
-from vice.util import (
+from vice.protocol import (
     STX, API_VERSION,
     REQ_HDR_FMT, REQ_HDR_SIZE,
     RESP_HDR_FMT,
