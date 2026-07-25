@@ -190,6 +190,30 @@ def populate_initial_state():
     log.debug("populate_initial_state(): complete")
 
 
+def _end_batch_checked(client, where):
+    """End a batch and surface any operation that failed inside it.
+
+    ghidratrace's Batch._get_result catches BaseException and *returns* the exception object
+    instead of raising, so end_batch() hands back a list that may contain exceptions. All three
+    call sites here discarded it, which meant a failed queued operation -- an endTx among them --
+    left no trace in this process. The next statement was trace.save(), and if the transaction
+    had not actually closed Ghidra answered "Can't save during transaction", killing the agent
+    with no indication of the real cause.
+
+    Note end_batch() returns None when the batch is nested and the refcount has not reached zero;
+    only the outermost end_batch waits on the futures.
+    """
+    results = client.end_batch()
+    if not results:
+        return
+    failures = [r for r in results if isinstance(r, BaseException)]
+    if failures:
+        raise RuntimeError(
+            f"{where}: {len(failures)} of {len(results)} batched trace operations failed; "
+            f"first: {failures[0]!r}"
+        )
+
+
 def _populate_initial_trace(
     trace, controller, regs, checkpoints, start, end, data, pc
 ):
@@ -218,7 +242,7 @@ def _populate_initial_trace(
             put_event_thread()
     finally:
         log.debug("populate_initial_state(): end_batch")
-        STATE.require_client().end_batch()
+        _end_batch_checked(STATE.require_client(), "populate_initial_state")
     log.debug("populate_initial_state(): save")
     trace.save()
 
@@ -483,7 +507,7 @@ def on_stop(remaining_ms=_default_remaining_ms):
                 put_event_thread()
         finally:
             log.debug("on_stop(): end_batch")
-            client.end_batch()
+            _end_batch_checked(client, "on_stop")
         log.debug("on_stop(): save")
         trace.save()
 
@@ -567,7 +591,7 @@ def sync_result(kind: str, result, remaining_ms):
                 else:
                     raise ValueError(f"Unsupported trace sync kind: {kind}")
         finally:
-            client.end_batch()
+            _end_batch_checked(client, "sync_trace")
 
 
 def put_breakpoints_from(checkpoints):
