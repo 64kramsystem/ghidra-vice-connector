@@ -61,7 +61,8 @@ def repo(tmp_path: Path) -> Path:
     (root / "CHANGELOG.md").write_text(CHANGELOG, encoding="utf-8")
     git(root, "add", "-A")
     git(root, "commit", "-qm", "initial")
-    remote = tmp_path / "remote.git"
+    remote = tmp_path / "expected" / "owner-repo.git"
+    remote.parent.mkdir(parents=True, exist_ok=True)
     git(tmp_path, "init", "-q", "--bare", str(remote))
     git(root, "remote", "add", "origin", str(remote))
     git(root, "push", "-q", "origin", release.DEFAULT_BRANCH)
@@ -91,6 +92,8 @@ def make_extension(
 
 
 def recording_runner(repo: Path, *, fail: str | None = None, build: bool = True):
+    uploaded: list[str] = []
+
     def runner(command, cwd):
         parts = [str(part) for part in command]
         joined = " ".join(parts)
@@ -101,16 +104,19 @@ def recording_runner(repo: Path, *, fail: str | None = None, build: bool = True)
         if build and "gradlew" in joined:
             make_extension(repo, release.read_version(repo))
             return ""
-        if parts[:3] == ["gh", "release", "view"]:
-            # Derived from the version, not the manifest: the manifest is the
-            # thing under test.
-            version = release.read_version(repo)
-            return "\n".join(
-                [path.name for path in release.expected_artifacts(repo, version)]
-                + ["SHA256SUMS"]
+        if parts[:3] == ["gh", "release", "create"]:
+            # Record what was actually uploaded: trailing arguments that are
+            # existing paths. A fake that reports the canonical set regardless
+            # would hide an upload that omitted the artifact.
+            uploaded.extend(
+                Path(part).name for part in parts[3:] if Path(part).is_file()
             )
+            return ""
+        if parts[:3] == ["gh", "release", "view"]:
+            return "\n".join(uploaded)
         return ""
 
+    runner.uploaded = uploaded  # type: ignore[attr-defined]
     return runner
 
 
@@ -297,9 +303,11 @@ def test_publish_marks_the_release_latest(repo: Path):
     prepared(repo)
     commands: list[list[str]] = []
 
+    inner = recording_runner(repo)
+
     def runner(command, cwd):
         commands.append([str(part) for part in command])
-        return recording_runner(repo)(command, cwd)
+        return inner(command, cwd)
 
     release.publish(repo, runner)
 
@@ -308,19 +316,29 @@ def test_publish_marks_the_release_latest(repo: Path):
     assert release.MARK_LATEST is True
 
 
-def test_publish_pins_gh_to_the_origin_repository(repo: Path):
+def test_publish_pins_gh_to_the_origin_repository(repo: Path, tmp_path: Path):
+    """Independently expected repo: comparing against origin_repo() is circular.
+
+    That function builds the command, so a mutation making it prefer `upstream`
+    would satisfy an assertion phrased in its own terms.
+    """
     git(repo, "remote", "add", "upstream", "https://github.com/someone/else.git")
     prepared(repo)
     commands: list[list[str]] = []
 
+    inner = recording_runner(repo)
+
     def runner(command, cwd):
         commands.append([str(part) for part in command])
-        return recording_runner(repo)(command, cwd)
+        return inner(command, cwd)
 
     release.publish(repo, runner)
 
-    for call in [c for c in commands if c[0] == "gh"]:
-        assert call[call.index("--repo") + 1] == release.origin_repo(repo)
+    gh_calls = [c for c in commands if c[0] == "gh"]
+    assert gh_calls
+    for call in gh_calls:
+        assert call[call.index("--repo") + 1] == "expected/owner-repo"
+        assert "someone/else" not in call
 
 
 def test_publish_refuses_when_the_tag_is_absent_from_origin(repo: Path):
@@ -477,9 +495,11 @@ def test_publish_takes_notes_from_the_tag(repo: Path):
     prepared(repo)
     commands: list[list[str]] = []
 
+    inner = recording_runner(repo)
+
     def runner(command, cwd):
         commands.append([str(part) for part in command])
-        return recording_runner(repo)(command, cwd)
+        return inner(command, cwd)
 
     release.publish(repo, runner)
 
@@ -620,3 +640,60 @@ def test_the_full_gate_and_build_sets_are_present():
     assert release.BUILD == (
         ("./gradlew", "--no-daemon", "clean", "buildExtension"),
     )
+
+
+def test_every_gate_is_actually_executed(repo: Path):
+    """Asserting the GATES tuple proves it exists, not that the loop runs it.
+
+    Changing the loop to GATES[:1] silently skipped bats and left every other
+    test green. Injecting a failure from each gate in turn is what proves each
+    one is reached.
+    """
+    for gate in release.GATES:
+        marker = gate[-1]
+        before_head = release.head_sha(repo)
+
+        with pytest.raises(release.ReleaseError, match="injected failure"):
+            release.prepare(repo, "minor", recording_runner(repo, fail=marker))
+
+        # Reached and propagated, and the failure rolled everything back.
+        assert release.head_sha(repo) == before_head
+        assert git(repo, "status", "--porcelain").strip() == ""
+        assert git(repo, "tag", "--list").strip() == ""
+
+
+def test_publish_uploads_the_artifact_and_the_checksums(repo: Path):
+    """A create call that omitted the zip would otherwise pass unnoticed."""
+    version = prepared(repo)
+    commands: list[list[str]] = []
+    inner = recording_runner(repo)
+
+    def runner(command, cwd):
+        commands.append([str(part) for part in command])
+        return inner(command, cwd)
+
+    release.publish(repo, runner)
+
+    create = next(c for c in commands if c[:3] == ["gh", "release", "create"])
+    uploaded = sorted(Path(part).name for part in create[3:] if Path(part).is_file())
+    expected = sorted(
+        [path.name for path in release.expected_artifacts(repo, version)]
+        + [release.CHECKSUMS_PATH.name]
+    )
+    assert uploaded == expected
+
+
+def test_ci_does_not_publish_releases():
+    """Ported from mcp-next: a resurrected release job must fail the suite."""
+    import yaml
+
+    workflow_path = REPO_ROOT / ".github" / "workflows" / "build.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.load(workflow_text, Loader=yaml.BaseLoader)
+
+    assert "release" not in workflow["jobs"]
+    assert all(
+        job.get("permissions", {}).get("contents") != "write"
+        for job in workflow["jobs"].values()
+    )
+    assert "gh release create" not in workflow_text
