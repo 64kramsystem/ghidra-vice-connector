@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Added `tools/release`, replacing the retired CI release job. `prepare
+  --major|--minor|--patch` writes `CONNECTOR_VERSION`, regenerates the published
+  contract from it, rolls the changelog, runs the gates against that candidate,
+  builds the extension, then commits, records a manifest and tags. `publish`
+  creates the GitHub release from the pushed tag and marks it latest, since these
+  releases are the only way to install without a JDK, Gradle and a Ghidra
+  install. The changelog is rolled before the build because
+  `buildExtension.gradle` copies the project root, so a stale one would ship
+  inside the zip — which `prepare` now checks. The live-VICE suite is excluded
+  from the release gates and says so: it needs a running emulator, and CI covers
+  it on every push.
+
 - Versioning moves to semantic versions, starting at `0.99.0`. `CONNECTOR_VERSION`
   in `contracts.py` is the source of truth, and the packaged extension now carries
   it as `connectorVersion` so an installed copy can be identified without a
