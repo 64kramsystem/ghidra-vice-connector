@@ -205,9 +205,14 @@ class RawEvent:
     kind: str
     response_type: int
     pc: Optional[int]
+    # `checkpoint` stays singular for existing consumers and holds the first
+    # match; `checkpoints` carries every checkpoint VICE reported for this stop.
+    # Appended last with a default so existing positional construction keeps
+    # working.
     checkpoint: Optional[Checkpoint]
     body: bytes
     received_at: float
+    checkpoints: Tuple[Checkpoint, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -378,7 +383,7 @@ class ViceBmpClient:
         self._event_callback: Optional[Callable[[RawEvent], None]] = None
         self._terminal_callback: Optional[Callable[[ViceConnectionError], None]] = None
         self._raw_sequence = 0
-        self._pending_checkpoint: Optional[Checkpoint] = None
+        self._pending_checkpoints: List[Checkpoint] = []
         self._diagnostics = collections.deque(maxlen=diagnostic_limit)
         self.reg_name_to_id: Dict[str, int] = {}
         self.reg_id_to_name: Dict[int, str] = {}
@@ -415,7 +420,7 @@ class ViceBmpClient:
                 if self._running:
                     raise ViceValidationError("VICE client is already connected")
                 self._terminal_error = None
-                self._pending_checkpoint = None
+                self._pending_checkpoints = []
                 self._sock = socket.create_connection(
                     (self.host, self.port), timeout=10
                 )
@@ -659,11 +664,15 @@ class ViceBmpClient:
             )
         if frame.response_type == RESP_CHECKPOINT_INFO:
             checkpoint = parse_checkpoint_info(frame.body)
-            if self._pending_checkpoint is not None:
-                raise ViceProtocolError(
-                    "received two checkpoint-info events without a stopped event"
-                )
-            self._pending_checkpoint = checkpoint
+            # VICE emits one checkpoint-info event per matching enabled
+            # checkpoint before it consults cp->stop (mon_breakpoint.c), so a
+            # single stop can carry several. A non-stopping checkpoint gets no
+            # following stop at all, so it is published immediately instead.
+            if checkpoint.stop_on_hit:
+                self._pending_checkpoints.append(checkpoint)
+            else:
+                self._emit_event("checkpoint_hit", frame.response_type,
+                                 None, checkpoint, (checkpoint,), frame.body)
             return
         if frame.response_type not in (RESP_STOPPED, RESP_RESUMED):
             with self._state_lock:
@@ -680,23 +689,43 @@ class ViceBmpClient:
                 f"invalid {len(frame.body)}-byte body"
             )
         pc = struct.unpack("<H", frame.body)[0] if frame.body else None
-        checkpoint = None
+        checkpoints: Tuple[Checkpoint, ...] = ()
         if frame.response_type == RESP_STOPPED:
-            checkpoint, self._pending_checkpoint = self._pending_checkpoint, None
-        elif self._pending_checkpoint is not None:
+            checkpoints = tuple(self._pending_checkpoints)
+            self._pending_checkpoints = []
+        elif self._pending_checkpoints:
             raise ViceProtocolError(
                 "checkpoint-info event was not followed by a stopped event"
             )
+        self._emit_event(
+            "stopped" if frame.response_type == RESP_STOPPED else "resumed",
+            frame.response_type,
+            pc,
+            checkpoints[0] if checkpoints else None,
+            checkpoints,
+            frame.body,
+        )
+
+    def _emit_event(
+        self,
+        kind: str,
+        response_type: int,
+        pc: Optional[int],
+        checkpoint: Optional[Checkpoint],
+        checkpoints: Tuple[Checkpoint, ...],
+        body: bytes,
+    ) -> None:
         with self._state_lock:
             self._raw_sequence += 1
             event = RawEvent(
                 self._raw_sequence,
-                "stopped" if frame.response_type == RESP_STOPPED else "resumed",
-                frame.response_type,
+                kind,
+                response_type,
                 pc,
                 checkpoint,
-                frame.body,
+                body,
                 time.monotonic(),
+                checkpoints,
             )
             callback = self._event_callback
         if callback is not None:
