@@ -2,13 +2,15 @@
 
 ## Unreleased
 
-- Added `tools/release`, replacing the retired CI release job. `prepare
-  --major|--minor|--patch` writes `CONNECTOR_VERSION`, regenerates the published
-  contract from it, rolls the changelog, runs the gates against that candidate,
-  builds the extension, then commits, records a manifest and tags. `publish`
-  creates the GitHub release from the pushed tag and marks it latest, since these
-  releases are the only way to install without a JDK, Gradle and a Ghidra
-  install. The changelog is rolled before the build because
+- Added `tools/release <major|minor|patch>`, replacing the retired CI release job.
+  One command: it refuses unless the checkout is on the default branch, clean and
+  exactly in sync with origin, then writes `CONNECTOR_VERSION`, regenerates the
+  published contract from it, rolls the changelog, runs the gates against that
+  candidate, builds the extension, commits, tags, pushes, and creates the GitHub
+  release marked latest — these releases being the only way to install without a
+  JDK, Gradle and a Ghidra install. Everything that can fail runs before the push;
+  if publishing fails afterwards, re-running the command resumes from the pushed
+  tag rather than bumping again. The changelog is rolled before the build because
   `buildExtension.gradle` copies the project root, so a stale one would ship
   inside the zip — which `prepare` now checks. The live-VICE suite is excluded
   from the release gates and says so: it needs a running emulator, and CI covers

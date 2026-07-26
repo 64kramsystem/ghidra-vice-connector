@@ -1,16 +1,22 @@
 """Scripted releases for ghidra-vice-connector.
 
-Two phases, because `gh release create` needs its target commit on the remote and
-this script deliberately does not push:
+One command:
 
-    tools/release prepare --minor    # gates, build, commit, manifest, tag
-    git push origin HEAD && git push origin v<version>
-    tools/release publish            # gh release create against the pushed tag
+    tools/release minor        # or major / patch
 
-`prepare` writes the version first and runs the gates against that release
-candidate, so a gate sees the mutation it exists to catch. On failure it restores
-the working tree, the index and the branch ref, so a failed release is a no-op
-rather than a mess to unpick.
+It refuses unless the checkout is on the default branch, clean, and exactly in
+sync with origin. Then it writes the version, rolls the changelog, runs the
+gates against that release candidate, builds and inspects the artifacts, commits,
+tags, pushes the branch and the tag, and publishes the GitHub release.
+
+Everything fallible happens *before* the push, because the push is a one-way
+door: after it, the tag is public and no rollback here can retract it. Until then
+a failure restores the working tree, the index and the branch ref, so a failed
+release is a no-op.
+
+If the push succeeds but publishing fails, re-running the same command resumes:
+it sees HEAD already tagged and that tag already on origin, skips straight to
+publishing, and says so.
 """
 
 from __future__ import annotations
@@ -206,6 +212,28 @@ def head_sha(repo_root: Path, runner: Runner = run) -> str:
     return runner(["git", "rev-parse", "HEAD"], repo_root).strip()
 
 
+def ensure_in_sync_with_origin(repo_root: Path, runner: Runner = run) -> None:
+    """Refuse unless the branch matches origin exactly.
+
+    Releasing something the remote does not have, or missing something it does,
+    produces a tag whose contents nobody else can reproduce.
+    """
+    runner(["git", "fetch", "--quiet", "origin", DEFAULT_BRANCH], repo_root)
+    ahead_behind = runner(
+        ["git", "rev-list", "--left-right", "--count",
+         f"origin/{DEFAULT_BRANCH}...HEAD"],
+        repo_root,
+    ).split()
+    if len(ahead_behind) != 2:
+        raise ReleaseError("cannot compare HEAD with origin")
+    behind, ahead = (int(value) for value in ahead_behind)
+    if behind or ahead:
+        raise ReleaseError(
+            f"HEAD is {ahead} ahead and {behind} behind origin/{DEFAULT_BRANCH}; "
+            "push or pull first"
+        )
+
+
 def ensure_tag_absent(repo_root: Path, tag: str, runner: Runner = run) -> None:
     local = runner(["git", "tag", "--list", tag], repo_root).strip()
     if local:
@@ -223,7 +251,8 @@ def origin_repo(repo_root: Path, runner: Runner = run) -> str:
     project entirely, so an unpinned publish would target the wrong repo.
     """
     url = runner(["git", "remote", "get-url", "origin"], repo_root).strip()
-    match = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?$", url)
+    # Backslashes normalised so a Windows path-style remote parses too.
+    match = re.search(r"[:/]([^/:\\]+/[^/\\]+?)(?:\.git)?$", url.replace("\\", "/"))
     if match is None:
         raise ReleaseError(f"cannot derive owner/repo from origin url {url!r}")
     return match.group(1)
@@ -390,10 +419,52 @@ def verify_artifact_contents(repo_root: Path, version: str) -> list[Artifact]:
 # ------------------------------------------------------------------------ prepare
 
 
+def release(repo_root: Path, bump: str, runner: Runner = run) -> str:
+    """Cut and publish a release in one command."""
+    ensure_default_branch(repo_root, runner)
+    ensure_clean(repo_root, runner)
+
+    resumed = resumable_version(repo_root, runner)
+    if resumed is not None:
+        print(f"v{resumed} is already tagged and pushed; publishing only")
+        return publish(repo_root, runner)
+
+    ensure_in_sync_with_origin(repo_root, runner)
+    version = prepare(repo_root, bump, runner)
+    tag = f"v{version}"
+
+    # The one-way door. Everything that can fail has already run.
+    print(f"push: origin HEAD and {tag}")
+    runner(["git", "push", "origin", "HEAD"], repo_root)
+    runner(["git", "push", "origin", tag], repo_root)
+
+    return publish(repo_root, runner)
+
+
+def resumable_version(repo_root: Path, runner: Runner = run) -> str | None:
+    """Return the version to publish when a previous run pushed but did not publish.
+
+    Only when HEAD carries a release tag that origin already has at the same
+    commit: that is exactly the state a failed publish leaves behind, and it is
+    not recoverable by rolling anything back.
+    """
+    tag = runner(
+        ["git", "tag", "--points-at", "HEAD", "--list", "v*"], repo_root
+    ).split()
+    if len(tag) != 1:
+        return None
+    version = tag[0][1:]
+    if _SEMVER_RE.fullmatch(version) is None:
+        return None
+    commit = head_sha(repo_root, runner)
+    peeled = runner(
+        ["git", "ls-remote", "origin", f"refs/tags/{tag[0]}^{{}}"], repo_root
+    ).split()
+    return version if peeled and peeled[0] == commit else None
+
+
 def prepare(repo_root: Path, bump: str, runner: Runner = run) -> str:
     changelog = repo_root / "CHANGELOG.md"
-    ensure_clean(repo_root, runner)
-    ensure_default_branch(repo_root, runner)
     if not unreleased_section(changelog):
         raise ReleaseError("## Unreleased is empty; nothing to release")
 
@@ -436,7 +507,6 @@ def prepare(repo_root: Path, bump: str, runner: Runner = run) -> str:
         _rollback(repo_root, original_head, release_commit, manifest_path, runner)
         raise
 
-    print(f"\nprepared {tag}. Now:\n  git push origin HEAD\n  git push origin {tag}\n  tools/release publish")
     return version
 
 
@@ -538,23 +608,18 @@ def publish(repo_root: Path, runner: Runner = run) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=f"{PRODUCT} release")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    prepare_parser = sub.add_parser("prepare", help="gate, build, commit and tag a release")
-    group = prepare_parser.add_mutually_exclusive_group(required=True)
-    for bump in ("major", "minor", "patch"):
-        group.add_argument(f"--{bump}", action="store_const", const=bump, dest="bump")
-
-    sub.add_parser("publish", help="create the GitHub release for the pushed tag")
+    parser = argparse.ArgumentParser(
+        description=f"Cut and publish a {PRODUCT} release",
+        epilog="Runs the gates, builds, commits, tags, pushes, and publishes.",
+    )
+    parser.add_argument(
+        "bump", choices=("major", "minor", "patch"), help="which component to raise"
+    )
 
     args = parser.parse_args(argv)
     repo_root = Path(__file__).resolve().parents[1]
     try:
-        if args.command == "prepare":
-            prepare(repo_root, args.bump)
-        else:
-            publish(repo_root)
+        release(repo_root, args.bump)
     except ReleaseError as error:
         print(f"release refused: {error}", file=sys.stderr)
         return 2

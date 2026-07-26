@@ -63,7 +63,9 @@ def repo(tmp_path: Path) -> Path:
     git(root, "commit", "-qm", "initial")
     remote = tmp_path / "expected" / "owner-repo.git"
     remote.parent.mkdir(parents=True, exist_ok=True)
-    git(tmp_path, "init", "-q", "--bare", str(remote))
+    # -b: a bare repo's HEAD otherwise follows init.defaultBranch, and a clone
+    # of it then lands on an empty branch of the wrong name.
+    git(tmp_path, "init", "-q", "--bare", "-b", release.DEFAULT_BRANCH, str(remote))
     git(root, "remote", "add", "origin", str(remote))
     git(root, "push", "-q", "origin", release.DEFAULT_BRANCH)
     return root
@@ -160,17 +162,18 @@ def test_version_is_not_taken_from_the_old_tag_scheme(repo: Path):
 
 
 def test_refuses_a_dirty_tree(repo: Path):
+    """Guard lives on the entry point, so it is asserted through release()."""
     (repo / "CHANGELOG.md").write_text(CHANGELOG + "\n", encoding="utf-8")
 
     with pytest.raises(release.ReleaseError, match="not clean"):
-        release.prepare(repo, "minor", recording_runner(repo))
+        release.release(repo, "minor", release_runner(repo))
 
 
 def test_refuses_a_non_default_branch(repo: Path):
     git(repo, "checkout", "-qb", "feature")
 
     with pytest.raises(release.ReleaseError, match="releases run on"):
-        release.prepare(repo, "minor", recording_runner(repo))
+        release.release(repo, "minor", release_runner(repo))
 
 
 def test_refuses_an_empty_unreleased_section(repo: Path):
@@ -697,3 +700,96 @@ def test_ci_does_not_publish_releases():
         for job in workflow["jobs"].values()
     )
     assert "gh release create" not in workflow_text
+
+
+# ------------------------------------------- single-command release() shape
+
+
+def release_runner(repo: Path, *, fail: str | None = None):
+    """Real git, stubbed gates/build/gh — enough to drive release() end to end."""
+    inner = recording_runner(repo)
+
+    def runner(command, cwd):
+        parts = [str(part) for part in command]
+        joined = " ".join(parts)
+        if fail and fail in joined:
+            raise release.ReleaseError(f"injected failure: {joined}")
+        return inner(command, cwd)
+
+    return runner
+
+
+def test_release_cuts_tags_pushes_and_publishes_in_one_command(repo: Path):
+    version = release.release(repo, "minor", release_runner(repo))
+
+    assert version == "0.100.0"
+    # Committed and tagged locally...
+    assert git(repo, "log", "-1", "--format=%s").strip() == "Release 0.100.0"
+    assert git(repo, "tag", "--points-at", "HEAD").strip() == "v0.100.0"
+    # ...and both reached origin, which is what publishing requires.
+    assert "v0.100.0" in git(repo, "ls-remote", "--tags", "origin")
+    assert git(repo, "rev-parse", "HEAD").strip() == git(
+        repo, "rev-parse", f"origin/{release.DEFAULT_BRANCH}"
+    ).strip()
+
+
+def test_release_refuses_when_behind_origin(repo: Path, tmp_path: Path):
+    """Releasing without the remote's commits produces an irreproducible tag."""
+    other = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(tmp_path / "expected" / "owner-repo.git"), str(other))
+    git(other, "config", "user.email", "other@example.com")
+    git(other, "config", "user.name", "Other")
+    (other / "elsewhere.txt").write_text("landed first", encoding="utf-8")
+    git(other, "add", "-A")
+    git(other, "commit", "-qm", "someone else's commit")
+    git(other, "push", "-q", "origin", release.DEFAULT_BRANCH)
+
+    with pytest.raises(release.ReleaseError, match="behind origin"):
+        release.release(repo, "minor", release_runner(repo))
+
+    assert git(repo, "tag", "--list").strip() == ""
+
+
+def test_release_refuses_when_ahead_of_origin(repo: Path):
+    (repo / "local-only.txt").write_text("unpushed", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "local work not pushed")
+
+    with pytest.raises(release.ReleaseError, match="ahead"):
+        release.release(repo, "minor", release_runner(repo))
+
+    assert git(repo, "tag", "--list").strip() == ""
+
+
+def test_a_failure_before_the_push_leaves_nothing_behind(repo: Path):
+    """The push is the one-way door; everything fallible runs before it."""
+    before_head = release.head_sha(repo)
+
+    with pytest.raises(release.ReleaseError, match="injected failure"):
+        release.release(repo, "minor", release_runner(repo, fail="pytest"))
+
+    assert release.head_sha(repo) == before_head
+    assert git(repo, "status", "--porcelain").strip() == ""
+    assert git(repo, "tag", "--list").strip() == ""
+    assert "v0.100.0" not in git(repo, "ls-remote", "--tags", "origin")
+
+
+def test_a_failed_publish_is_resumable_by_rerunning(repo: Path):
+    """After the push a rollback is impossible, so re-running must resume."""
+    with pytest.raises(release.ReleaseError, match="injected failure"):
+        release.release(repo, "minor", release_runner(repo, fail="gh release create"))
+
+    # The tag is public now; that state is not retractable here.
+    assert "v0.100.0" in git(repo, "ls-remote", "--tags", "origin")
+
+    # Re-running skips straight to publishing rather than bumping again.
+    assert release.release(repo, "minor", release_runner(repo)) == "0.100.0"
+    assert release.read_version(repo) == "0.100.0"
+    assert git(repo, "tag", "--list").strip() == "v0.100.0"
+
+
+def test_resume_does_not_trigger_for_an_unpushed_tag(repo: Path):
+    """A local-only tag is not the failed-publish state and must not resume."""
+    release.prepare(repo, "minor", recording_runner(repo))
+
+    assert release.resumable_version(repo) is None
