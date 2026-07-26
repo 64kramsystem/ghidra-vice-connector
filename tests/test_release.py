@@ -50,9 +50,7 @@ def repo(tmp_path: Path) -> Path:
     git(root, "init", "-q", "-b", release.DEFAULT_BRANCH)
     git(root, "config", "user.email", "test@example.com")
     git(root, "config", "user.name", "Test")
-    (root / ".gitignore").write_text(
-        f"dist/\n{release.MANIFEST_NAME}\n", encoding="utf-8"
-    )
+    (root / ".gitignore").write_text("dist/\n", encoding="utf-8")
     (root / release.CONTRACTS_PY).write_text(
         CONTRACTS.format(version="0.99.0"), encoding="utf-8"
     )
@@ -94,18 +92,22 @@ def make_extension(
 
 def recording_runner(repo: Path, *, fail: str | None = None, build: bool = True):
     def runner(command, cwd):
-        joined = " ".join(str(part) for part in command)
+        parts = [str(part) for part in command]
+        joined = " ".join(parts)
         if fail and fail in joined:
             raise release.ReleaseError(f"injected failure: {joined}")
-        if command[0] == "git":
+        if parts[0] == "git":
             return release.run(command, cwd)
         if build and "gradlew" in joined:
             make_extension(repo, release.read_version(repo))
             return ""
-        if command[:3] == ["gh", "release", "view"]:
-            manifest = release.read_manifest(repo)
+        if parts[:3] == ["gh", "release", "view"]:
+            # Derived from the version, not the manifest: the manifest is the
+            # thing under test.
+            version = release.read_version(repo)
             return "\n".join(
-                [entry["name"] for entry in manifest["artifacts"]] + ["SHA256SUMS"]
+                [path.name for path in release.expected_artifacts(repo, version)]
+                + ["SHA256SUMS"]
             )
         return ""
 
@@ -240,7 +242,7 @@ def test_a_failing_tag_resets_the_branch(repo: Path):
 
     assert release.head_sha(repo) == before_head
     assert git(repo, "status", "--porcelain").strip() == ""
-    assert not (repo / release.MANIFEST_NAME).exists()
+    assert not (repo / release.MANIFEST_PATH).exists()
 
 
 # --------------------------------------------------------- artifact contents
@@ -354,7 +356,7 @@ def test_publish_succeeds(repo: Path):
     version = prepared(repo)
 
     assert release.publish(repo, recording_runner(repo)) == version
-    assert (repo / "SHA256SUMS").is_file()
+    assert (repo / release.CHECKSUMS_PATH).is_file()
 
 
 # ---------------------------------------------------- contract regeneration
@@ -370,3 +372,126 @@ def test_write_version_regenerates_the_contract(
     release.write_version(repo, "0.100.0")
 
     assert calls == [repo]
+
+
+# ------------------------------------------------ blockers found in review
+
+
+def test_a_concurrent_commit_is_not_destroyed(repo: Path):
+    """Rollback must reset only the commit this run created."""
+
+    def runner(command, cwd):
+        parts = [str(part) for part in command]
+        if parts[:3] == ["git", "tag", "-a"]:
+            (repo / "other.txt").write_text("concurrent", encoding="utf-8")
+            git(repo, "add", "other.txt")
+            git(repo, "commit", "-qm", "concurrent work")
+            raise release.ReleaseError("injected failure: git tag -a")
+        return recording_runner(repo)(command, cwd)
+
+    with pytest.raises(release.ReleaseError, match="not resetting"):
+        release.prepare(repo, "minor", runner)
+
+    assert git(repo, "log", "-1", "--format=%s").strip() == "concurrent work"
+
+
+def test_an_injected_commit_failure_leaves_no_trace(repo: Path):
+    before_head = release.head_sha(repo)
+
+    with pytest.raises(release.ReleaseError, match="injected failure"):
+        release.prepare(repo, "minor", recording_runner(repo, fail="git commit"))
+
+    assert release.head_sha(repo) == before_head
+    assert git(repo, "status", "--porcelain").strip() == ""
+    assert git(repo, "tag", "--list").strip() == ""
+
+
+def test_an_injected_manifest_write_failure_resets_the_branch(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+):
+    before_head = release.head_sha(repo)
+
+    def explode(*args, **kwargs):
+        raise release.ReleaseError("injected failure: manifest write")
+
+    monkeypatch.setattr(release, "write_manifest", explode)
+
+    with pytest.raises(release.ReleaseError, match="injected failure"):
+        release.prepare(repo, "minor", recording_runner(repo))
+
+    assert release.head_sha(repo) == before_head
+    assert not (repo / release.MANIFEST_PATH).exists()
+
+
+def test_publish_rejects_a_manifest_missing_artifacts(repo: Path):
+    """The manifest is untrusted input; an empty one must not publish nothing."""
+    prepared(repo)
+    manifest = json.loads((repo / release.MANIFEST_PATH).read_text(encoding="utf-8"))
+    manifest["artifacts"] = []
+    (repo / release.MANIFEST_PATH).write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(release.ReleaseError, match="manifest lists"):
+        release.publish(repo, recording_runner(repo))
+
+
+def test_a_zip_without_a_changelog_is_rejected(repo: Path):
+    """Absence must fail: tolerating it would silently disable the staleness check."""
+
+    def runner(command, cwd):
+        parts = [str(part) for part in command]
+        if "gradlew" in " ".join(parts):
+            path = repo / "dist" / f"ghidra_12.1.2_PUBLIC_20260726_{release.PRODUCT}.zip"
+            path.parent.mkdir(exist_ok=True)
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    f"{release.PRODUCT}/extension.properties",
+                    "version=12.1.2\nconnectorVersion=0.100.0\n",
+                )
+            return ""
+        return recording_runner(repo, build=False)(command, cwd)
+
+    with pytest.raises(release.ReleaseError, match="has no ghidra-vice-connector/CHANGELOG"):
+        release.prepare(repo, "minor", runner)
+
+
+def test_a_zip_packaging_the_release_scratch_files_is_rejected(repo: Path):
+    """buildExtension copies the project root; these must never ship."""
+
+    def runner(command, cwd):
+        parts = [str(part) for part in command]
+        if "gradlew" in " ".join(parts):
+            path = make_extension(repo, "0.100.0")
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr(
+                    f"{release.PRODUCT}/{release.MANIFEST_PATH.name}",
+                    '{"artifacts": []}',
+                )
+            return ""
+        return recording_runner(repo, build=False)(command, cwd)
+
+    with pytest.raises(release.ReleaseError, match="packages release-manifest"):
+        release.prepare(repo, "minor", runner)
+
+
+def test_publish_takes_notes_from_the_tag(repo: Path):
+    prepared(repo)
+    commands: list[list[str]] = []
+
+    def runner(command, cwd):
+        commands.append([str(part) for part in command])
+        return recording_runner(repo)(command, cwd)
+
+    release.publish(repo, runner)
+
+    create = next(c for c in commands if c[:3] == ["gh", "release", "create"])
+    assert "--notes-from-tag" in create
+    assert "--notes" not in create
+
+
+def test_release_scratch_files_do_not_dirty_the_repository(repo: Path):
+    prepared(repo)
+    release.publish(repo, recording_runner(repo))
+
+    assert git(repo, "status", "--porcelain").strip() == ""
+    assert str(release.MANIFEST_PATH).startswith("dist/")
+    assert str(release.CHECKSUMS_PATH).startswith("dist/")
