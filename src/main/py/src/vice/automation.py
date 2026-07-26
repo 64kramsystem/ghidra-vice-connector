@@ -84,6 +84,7 @@ def _event(item: PublicEvent) -> dict:
             _checkpoint(item.checkpoint)
             if item.checkpoint is not None else None
         ),
+        "checkpoints": [_checkpoint(entry) for entry in item.checkpoints],
         "snapshot": item.snapshot,
     }
 

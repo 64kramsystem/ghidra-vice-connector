@@ -29,6 +29,10 @@ from .protocol import (
 
 EVENT_HISTORY_LIMIT = 1024
 
+# Unsolicited events published per operation_lock acquisition. Bounded so a
+# continuous checkpoint-hit stream cannot starve commands.
+UNSOLICITED_DRAIN_BATCH = 64
+
 
 class ViceStateError(ViceFailure):
     code = "vice_target_not_stopped"
@@ -89,6 +93,7 @@ class PublicEvent:
     checkpoint: Optional[Checkpoint]
     snapshot: Optional[int]
     received_at: float
+    checkpoints: Tuple[Checkpoint, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +150,7 @@ class ViceController:
         self._execution_state = "unknown"
         self._terminal_error: Optional[ViceConnectionError] = None
         self._last_snapshot: Optional[int] = None
+        self._last_evicted_stopped_sequence = 0
         self._sync_failures: Deque[Tuple[int, str]] = collections.deque(maxlen=128)
         self._coordinator_stop = False
         self._coordinator: Optional[threading.Thread] = None
@@ -347,7 +353,17 @@ class ViceController:
                 event.checkpoint,
                 snapshot,
                 event.received_at,
+                getattr(event, "checkpoints", ()),
             )
+            # Track evicted *stopped* events separately. A flood of
+            # checkpoint_hit events can roll the whole history without losing a
+            # single stop, and wait_for_stop must not report loss for that.
+            if (
+                self._history.maxlen is not None
+                and len(self._history) == self._history.maxlen
+                and self._history[0].kind == "stopped"
+            ):
+                self._last_evicted_stopped_sequence = self._history[0].sequence
             self._history.append(public)
             self._execution_state = (
                 "stopped" if event.kind == "stopped" else "running"
@@ -356,14 +372,33 @@ class ViceController:
             return public
 
     def _drain_pending(
-        self, deadline: Optional[float] = None
+        self,
+        deadline: Optional[float] = None,
+        limit: Optional[int] = None,
+        through: Optional[int] = None,
     ) -> List[PublicEvent]:
+        """Publish queued raw events.
+
+        `limit` bounds one batch so the unsolicited coordinator cannot hold
+        operation_lock indefinitely. `through` bounds the drain to a finite
+        watermark, which is what a command needs: without it, a continuous
+        checkpoint-hit stream means the queue never empties and the command's
+        pre-drain never returns, so its acknowledgement is never sent.
+        """
         result = []
-        while True:
+        while limit is None or len(result) < limit:
+            if through is not None and not self._has_raw_at_or_before(through):
+                break
             event = self._pop_raw(None, require=False)
             if event is None:
-                return result
+                break
             result.append(self._publish(event, deadline=deadline))
+        return result
+
+    def _has_raw_at_or_before(self, watermark: int) -> bool:
+        with self._condition:
+            return bool(self._raw_events) \
+                and self._raw_events[0].raw_sequence <= watermark
 
     def _coordinate_unsolicited(self) -> None:
         while True:
@@ -376,8 +411,13 @@ class ViceController:
                 if self._coordinator_stop:
                     return
             try:
+                # Bounded batches: a continuously firing non-stopping
+                # checkpoint would otherwise keep the raw queue non-empty and
+                # hold operation_lock indefinitely, starving interrupt and
+                # every other command. Releasing between batches lets a waiting
+                # command take the lock.
                 with self.operation_lock:
-                    self._drain_pending()
+                    self._drain_pending(limit=UNSOLICITED_DRAIN_BATCH)
             except ViceConnectionError:
                 continue
             except BaseException:
@@ -413,7 +453,11 @@ class ViceController:
         deadline = time.monotonic() + timeout_ms / 1000.0
         with self.operation_lock:
             # These events predate this operation, so its action was not applied.
-            preceding = self._drain_pending(deadline)
+            # Bounded by the watermark taken on entry: a continuous hit stream
+            # must not stop this command from being acknowledged.
+            preceding = self._drain_pending(
+                deadline, through=self._raw_watermark()
+            )
             if precondition == "running":
                 self._require_running()
             else:
@@ -533,7 +577,7 @@ class ViceController:
         deadline = time.monotonic() + timeout_ms / 1000.0
         remaining_ms = lambda: self._remaining_ms(deadline)
         with self.operation_lock:
-            self._drain_pending(deadline)
+            self._drain_pending(deadline, through=self._raw_watermark())
             self._require_stopped()
             sequence = self._next_command_sequence()
             result = callback(remaining_ms)
@@ -809,10 +853,15 @@ class ViceController:
                     raise self._terminal_error or ViceConnectionError(
                         "VICE connection changed while waiting"
                     )
+                # Only a genuinely evicted *stopped* event is history loss.
+                # Eviction caused by checkpoint_hit traffic is not, because no
+                # stop the caller could have been waiting for was dropped.
+                if after_sequence < self._last_evicted_stopped_sequence:
+                    raise ViceEventHistoryLost(
+                        self._history[0].sequence if self._history
+                        else self._last_evicted_stopped_sequence
+                    )
                 if self._history:
-                    oldest = self._history[0].sequence
-                    if after_sequence < oldest - 1:
-                        raise ViceEventHistoryLost(oldest)
                     for event in self._history:
                         if (
                             event.sequence > after_sequence
