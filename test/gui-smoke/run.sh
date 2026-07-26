@@ -299,7 +299,7 @@ if [ -n "${VICE_C64_ROM_DIR:-}" ]; then
   )
 fi
 setsid x64sc \
-  -binarymonitor -binarymonitoraddress "127.0.0.1:$VICE_PORT" \
+  -binarymonitor -binarymonitoraddress "ip4://127.0.0.1:$VICE_PORT" \
   -sounddev dummy \
   "${VICE_ROM_ARGS[@]}" \
   -autostartprgmode 1 \

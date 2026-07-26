@@ -1,5 +1,6 @@
 """Versioned TraceRMI automation methods for the C64 VICE connector."""
 
+import base64
 import json
 from typing import Annotated, List
 
@@ -527,6 +528,49 @@ def wait_for_stop(
         return controller.command_sequence, {"event": _event(event)}
 
     return _call(process, "wait_for_stop", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_capture_display")
+def capture_display(
+    process: C64, use_vic: bool = True, timeout_ms: int = 10_000
+) -> str:
+    """Return one rendered frame as an indexed buffer plus its palette.
+
+    Pixels are row-major, one byte per pixel, and each byte is an index into
+    `palette` by array position. `buffer_base64` is standard RFC 4648 base64
+    with padding. No image is encoded here: PNG encoding needs no emulator and
+    is unit-testable upstream.
+
+    `vice_revision` is null on a release build, which reports no revision at
+    all, and carries the integer only for an SVN or nightly build.
+    """
+    def invoke(controller):
+        if not isinstance(use_vic, bool):
+            raise ViceValidationError("use_vic must be a boolean")
+        sequence, (frame, palette) = controller.capture_display(
+            use_vic=use_vic, timeout_ms=timeout_ms
+        )
+        return sequence, {
+            "width": frame.width,
+            "height": frame.height,
+            "inner": {
+                "x_offset": frame.x_offset,
+                "y_offset": frame.y_offset,
+                "width": frame.inner_width,
+                "height": frame.inner_height,
+            },
+            "bits_per_pixel": frame.bits_per_pixel,
+            "buffer_length": len(frame.buffer),
+            "buffer_base64": base64.b64encode(frame.buffer).decode("ascii"),
+            "palette": [
+                {"r": entry.r, "g": entry.g, "b": entry.b}
+                for entry in palette
+            ],
+            "vice_version": controller.vice_version,
+            "vice_revision": controller.vice_revision,
+        }
+
+    return _call(process, "capture_display", invoke)
 
 
 @REGISTRY.method(name="c64_vice_v1_reset")

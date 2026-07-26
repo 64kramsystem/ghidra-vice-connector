@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch, call
 import pytest
 
 from vice import commands, arch
-from vice.util import Bank
+from vice.util import Bank, ViceInfo
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -22,7 +22,7 @@ def make_mock_vice(pc=0xC000):
     }
     vice.checkpoint_list.return_value = []
     vice.memory_get.return_value = b'\xEA' * 0x400  # NOP fill
-    vice.vice_info.return_value = '3.10.0'
+    vice.vice_info.return_value = ViceInfo((3, 10, 0, 0), None)
     vice.banks_available.return_value = [
         Bank(id=0, name='default'),
         Bank(id=0, name='cpu'),
@@ -209,8 +209,8 @@ class TestPutEnvironment:
         assert vals['_arch'] == '6502'
         assert vals['_os'] == 'C64'
         assert vals['_endian'] == 'little'
-        assert vals['_debugger'] == 'VICE 3.10.0'
-        assert vals['_display'] == 'VICE 3.10.0 @ 127.0.0.1:6502'
+        assert vals['_debugger'] == 'VICE 3.10.0.0'
+        assert vals['_display'] == 'VICE 3.10.0.0 @ 127.0.0.1:6502'
         env.insert.assert_called_once()
 
     def test_banks_keyed_by_name(self):

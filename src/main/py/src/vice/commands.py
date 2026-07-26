@@ -363,7 +363,10 @@ def put_environment(banks_value=None):
     """Populate the Environment node: VICE version, connection, memory banks."""
     t = STATE.trace
     vice = STATE.require_vice()
-    version = STATE.require_controller().vice_version or vice.vice_info()
+    version = (
+        STATE.require_controller().vice_version
+        or vice.vice_info().version_string
+    )
 
     env = t.create_object(ENV_PATH)
     env.set_value('_arch', '6502')

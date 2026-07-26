@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 API = "c64.vice/1"
 API_MAJOR = 1
 API_MINOR = 0
-SURFACE_REVISION = 1
+SURFACE_REVISION = 2
 METHOD_NAMESPACE = "c64_vice_v1_"
 CONNECTOR_NAME = "ghidra-vice-connector"
 CONNECTOR_VERSION = "0.99.0"
@@ -32,6 +32,7 @@ CAPABILITIES = (
     "execution.interrupt",
     "execution.wait_for_stop",
     "machine.reset",
+    "display.capture",
     "trace.sync",
 )
 
@@ -132,6 +133,11 @@ METHODS: List[Dict[str, Any]] = [
         required("timeout_ms", "LONG"),
     ),
     method("reset", optional("kind", "STRING", "soft"), TIMEOUT),
+    method(
+        "capture_display",
+        optional("use_vic", "BOOL", True),
+        TIMEOUT,
+    ),
 ]
 
 

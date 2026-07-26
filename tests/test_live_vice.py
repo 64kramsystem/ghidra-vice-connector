@@ -17,9 +17,9 @@ import time
 
 import pytest
 
-from vice.controller import ViceController
+from vice.controller import ViceController, ViceStateError
 from vice.protocol import (
-    ViceBmpClient, ViceFailure, ViceValidationError,
+    ViceBmpClient, ViceFailure, ViceUnsupportedBuildError, ViceValidationError,
     CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE,
 )
 
@@ -59,6 +59,10 @@ def vice():
     controller.start_event_coordinator(assume_stopped=True)
 
     class LiveVice:
+        def __init__(self):
+            self.controller = controller
+            self.client = client
+
         def __getattr__(self, name):
             return getattr(client, name)
 
@@ -73,8 +77,27 @@ def vice():
         def interrupt(self):
             return controller.interrupt(timeout_ms=5_000)
 
+        def capture_display(self, use_vic=True):
+            return controller.capture_display(
+                use_vic=use_vic, timeout_ms=15_000
+            )
+
     yield LiveVice()
     controller.close()
+
+
+def require_display_capture(vice):
+    """Skip unless this build carries the r46020 `display get` fix.
+
+    Deliberately asks the production guard rather than re-deriving the rule:
+    an affected VICE writes past its own allocation *before* replying, so a
+    test that decided this for itself could drift into triggering exactly the
+    bug the guard exists to prevent.
+    """
+    try:
+        vice.client._require_display_get_support()
+    except ViceUnsupportedBuildError as refusal:
+        pytest.skip(str(refusal))
 
 
 # ── Connection and discovery ─────────────────────────────────────────────────
@@ -90,9 +113,12 @@ class TestLiveConnection:
     def test_ping_succeeds(self, vice):
         assert vice.ping() is True
 
-    def test_vice_info_returns_version_string(self, vice):
+    def test_vice_info_returns_version_components_and_revision(self, vice):
         info = vice.vice_info()
-        assert re.fullmatch(r'\d+\.\d+\.\d+', info)
+        assert len(info.version) >= 3
+        assert re.fullmatch(r'(\d+\.){2,}\d+', info.version_string)
+        # None on a release build, which reports no revision at all.
+        assert info.revision is None or info.revision > 0
 
     def test_banks_available_returns_list(self, vice):
         banks = vice.banks_available()
@@ -324,6 +350,41 @@ class TestLiveReset:
         time.sleep(0.3)
         regs = vice.registers_get()
         assert 'PC' in regs
+
+
+# ── Display capture ──────────────────────────────────────────────────────────
+#
+# These require a VICE at r46020 or later and skip on anything older: before
+# that revision VICE overruns its own allocation while answering `display get`,
+# so the command must never be sent to such a build. The skip is decided by the
+# production guard, not by a rule copied into the test.
+
+class TestLiveDisplayCapture:
+    def test_capture_returns_a_renderable_c64_frame(self, vice):
+        require_display_capture(vice)
+        _sequence, (frame, palette) = vice.capture_display()
+        assert frame.bits_per_pixel == 8
+        assert (frame.inner_width, frame.inner_height) == (320, 200)
+        assert len(frame.buffer) == frame.width * frame.height
+        assert frame.x_offset + frame.inner_width <= frame.width
+        assert frame.y_offset + frame.inner_height <= frame.height
+        assert max(frame.buffer) < len(palette)
+        # A uniformly blank frame satisfies every structural check above while
+        # proving nothing was actually rendered.
+        assert len(set(frame.buffer)) >= 2
+
+    def test_capture_while_running_is_refused_without_stopping(self, vice):
+        require_display_capture(vice)
+        vice.resume()
+        try:
+            with pytest.raises(ViceStateError) as caught:
+                vice.capture_display()
+            assert caught.value.code == "vice_target_not_stopped"
+            # The refusal must not itself have stopped the emulator: it is a
+            # precondition check, taken before any frame reaches the socket.
+            assert vice.controller.execution_state == "running"
+        finally:
+            vice.interrupt()
 
 
 # ── Concurrent commands ──────────────────────────────────────────────────────

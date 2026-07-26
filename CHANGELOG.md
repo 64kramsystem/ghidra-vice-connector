@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+- Added display capture: `c64_vice_v1_capture_display` returns one rendered frame as a
+  base64 indexed buffer (row-major, one byte per pixel, each byte an index into the
+  returned palette by array position) together with the debug geometry, the inner
+  screen rectangle, the palette from `palette get`, and the VICE version and revision.
+  The connector deliberately returns the raw buffer rather than an encoded image: PNG
+  encoding needs no emulator and is unit-testable upstream. Capability
+  `display.capture`; `surface_revision` is now `2`.
+
+  Capture requires a **stopped** target and refuses `running` or `unknown` before
+  sending anything. Reading a frame looks harmless, but sending any binary-monitor
+  command traps VICE into the monitor, which emits registers and `STOPPED`; a capture
+  advertised as read-only would stop the emulator and then report that nothing changed.
+  For a frame mid-execution, call `interrupt`, `capture_display`, `resume`.
+
+  `display get` is **gated on the VICE build**. Before r46020, VICE sized the response
+  four bytes short of what it writes and overran its own allocation *before* replying,
+  so no client-side validation can make an affected build safe — the command is simply
+  never sent to one. A build reporting a revision is judged by it (`>= r46020`); a
+  release build, which reports no revision at all, is judged by its release family
+  (`>= 3.11`); anything unparseable, or a connection whose build is not yet known, is
+  refused. A refusal is `vice_unsupported_build`, naming the detected build and the
+  requirement; a malformed `VICE_INFO` stays `vice_protocol_error`.
+
+- `ViceBmpClient.vice_info()` now returns the full `ViceInfo` record — every version
+  component plus `revision`, which is `None` on a release build — instead of a
+  truncated `"major.minor.build"` string that discarded the `SVN` field. The build
+  guard needs both halves. `controller.vice_version` consequently reports every
+  component VICE sends (`3.10.0.0`, not `3.10.0`), and `controller.vice_revision` is
+  new.
+
+- Fixed the binary-monitor bind address. The launcher passed a bare `HOST:PORT` to
+  `-binarymonitoraddress`; VICE 3.10 accepts that argument, binds nothing, and logs no
+  error, so the launcher's port wait spun for its full 30 seconds and the launch failed
+  with a timeout that blamed the port rather than the argument. It now passes the
+  documented URI form — `ip4://HOST:PORT`, or `ip6://[HOST]:PORT` for an IPv6 literal —
+  and only for the bind address; client-side connects stay plain host and port. The same
+  correction applies to `README.md`, the connect-only launcher's description, the GUI
+  smoke harness, and the CI job that starts VICE for the live suite.
+
 - Added `tools/release <major|minor|patch>`, replacing the retired CI release job.
   One command: it refuses unless the checkout is on the default branch, clean and
   exactly in sync with origin, then writes `CONNECTOR_VERSION`, regenerates the

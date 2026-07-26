@@ -29,6 +29,85 @@ DEFAULT_REGISTERS = [
     (5, 'FLAGS', 8),
 ]
 
+# ── display get (0x84) / palette get (0x91) fixtures ──────────────────────────
+#
+# A 4x2 debug buffer with a 2x2 inner screen at (1, 0). Small enough to assert
+# byte for byte, and every pixel indexes one of the two default palette entries.
+DEFAULT_DISPLAY_WIDTH = 4
+DEFAULT_DISPLAY_HEIGHT = 2
+DEFAULT_DISPLAY_BUFFER = bytes([0, 1, 0, 1,
+                                1, 0, 1, 0])
+DEFAULT_PALETTE = ((0, 0, 0), (255, 255, 255))
+
+
+def build_display_response(
+    *,
+    width: int = DEFAULT_DISPLAY_WIDTH,
+    height: int = DEFAULT_DISPLAY_HEIGHT,
+    x_offset: int = 1,
+    y_offset: int = 0,
+    inner_width: int = 2,
+    inner_height: int = 2,
+    bits_per_pixel: int = 8,
+    buffer: Optional[bytes] = None,
+    info_extension: bytes = b'',
+    declared_info_length: Optional[int] = None,
+    declared_buffer_length: Optional[int] = None,
+    trailing: bytes = b'',
+) -> bytes:
+    """Build a DISPLAY_GET response body.
+
+    Wire format: FL(4) DW(2) DH(2) XO(2) YO(2) IW(2) IH(2) BP(1) BL(4) BD(BL).
+    `FL` counts only the DW..BP metadata -- neither `FL` itself nor `BL` -- so
+    `info_extension` bytes land *before* `BL`, which is exactly the forward
+    compatibility the parser must honour.
+    """
+    pixels = DEFAULT_DISPLAY_BUFFER if buffer is None else buffer
+    info = struct.pack(
+        '<HHHHHHB',
+        width, height, x_offset, y_offset, inner_width, inner_height,
+        bits_per_pixel,
+    ) + info_extension
+    info_length = len(info) if declared_info_length is None \
+        else declared_info_length
+    buffer_length = len(pixels) if declared_buffer_length is None \
+        else declared_buffer_length
+    return (
+        struct.pack('<I', info_length)
+        + info
+        + struct.pack('<I', buffer_length)
+        + pixels
+        + trailing
+    )
+
+
+def build_palette_response(
+    entries=DEFAULT_PALETTE,
+    *,
+    item_extension: bytes = b'',
+    declared_count: Optional[int] = None,
+    truncate: int = 0,
+    trailing: bytes = b'',
+) -> bytes:
+    """Build a PALETTE_GET response body: PC(2) then PC items of IS(1) R G B."""
+    count = len(entries) if declared_count is None else declared_count
+    body = struct.pack('<H', count)
+    for red, green, blue in entries:
+        item = struct.pack('<BBB', red, green, blue) + item_extension
+        body += struct.pack('<B', len(item)) + item
+    body += trailing
+    return body[:len(body) - truncate] if truncate else body
+
+
+def build_vice_info_body(version=(3, 11, 0, 0), revision: int = 0) -> bytes:
+    """Build a VICE_INFO response body: VL, version bytes, SL, SVN bytes.
+
+    `revision` 0 is how a *release* build reports "no revision at all"; VICE
+    still sends the four zero bytes.
+    """
+    body = bytes([len(version)]) + bytes(version)
+    return body + b'\x04' + struct.pack('<I', revision)
+
 
 def build_registers_available_body(registers=None) -> bytes:
     """Build a REGISTERS_AVAILABLE response body from [(id, name, bit_size), ...] list.

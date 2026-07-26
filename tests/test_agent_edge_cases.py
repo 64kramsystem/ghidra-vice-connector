@@ -25,7 +25,7 @@ def test_connect_vice_creates_exactly_one_client_and_controller(mock_server):
     assert isinstance(commands.STATE.controller, ViceController)
     assert isinstance(commands.STATE.require_vice(), ViceBmpClient)
     assert commands.STATE.controller.client is commands.STATE.require_vice()
-    assert commands.STATE.controller.vice_version == "3.10.0"
+    assert commands.STATE.controller.vice_version == "3.10.0.0"
 
 
 def test_connect_vice_does_not_start_second_socket(mock_server):

@@ -44,7 +44,7 @@ Install the built extension zip through **File > Install Extensions** in Ghidra,
 1. Start VICE with the binary monitor enabled:
 
    ```sh
-   x64sc -binarymonitor -binarymonitoraddress 127.0.0.1:6502
+   x64sc -binarymonitor -binarymonitoraddress ip4://127.0.0.1:6502
    ```
 
 2. In Ghidra, open the **Debugger** tool.
@@ -101,7 +101,7 @@ GHIDRA_HOME=$GHIDRA_PATH data/support/import-prg.sh data/test.prg data/ghidra-pr
 #
 # Manual: Right-click test_raw.bin and choose "Open With → Debugger"
 
-x64 -binarymonitor -binarymonitoraddress 127.0.0.1:6502 data/test.prg &
+x64 -binarymonitor -binarymonitoraddress ip4://127.0.0.1:6502 data/test.prg &
 $GHIDRA_PATH/ghidraRun $PWD/data/ghidra-project/ViceTest.gpr
 
 # Attach debugger: Debugger → Configure and Launch… → VICE…

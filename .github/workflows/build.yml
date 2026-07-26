@@ -88,6 +88,12 @@ jobs:
     - name: Install pytest
       run: pip install pytest
 
+    # NB: this apt package is whatever the runner image ships, which predates
+    # r46020. The live display-capture tests therefore SKIP here: before that
+    # revision VICE overruns its own allocation while answering `display get`,
+    # so the connector's build guard refuses to send the command and those
+    # tests decline to run rather than trigger the bug. Pinning this install to
+    # r46020 or later -- or building VICE from source -- is what turns them on.
     - name: Install VICE
       run: |
         sudo apt-get update
@@ -101,7 +107,7 @@ jobs:
     - name: Start VICE with the binary monitor
       run: |
         xvfb-run -a x64sc \
-          -binarymonitor -binarymonitoraddress 127.0.0.1:6502 \
+          -binarymonitor -binarymonitoraddress ip4://127.0.0.1:6502 \
           -sounddev dummy \
           -kernal  "$VICE_C64_ROM_DIR/kernal-901227-03.bin" \
           -basic   "$VICE_C64_ROM_DIR/basic-901226-01.bin" \
