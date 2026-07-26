@@ -550,3 +550,73 @@ def test_checksums_match_recomputed_artifact_hashes(repo: Path):
 
     assert written == expected
     assert all(len(digest) == 64 and set(digest) != {"0"} for digest in written.values())
+
+
+# --------------------------------------------- guards ported from mcp-next
+# These existed in ghidra-mcp-next but not here, which is how five mutations
+# survived a round of review: hand-porting fixes across two repos leaves gaps.
+
+
+@pytest.mark.parametrize(
+    ("current", "bump", "expected"),
+    [
+        ("0.99.0", "patch", "0.99.1"),
+        ("0.99.0", "minor", "0.100.0"),
+        ("0.99.0", "major", "1.0.0"),
+        ("0.100.3", "patch", "0.100.4"),
+        ("1.2.3", "major", "2.0.0"),
+    ],
+)
+def test_next_version_arithmetic(current: str, bump: str, expected: str):
+    assert release.next_version(current, bump) == expected
+
+
+def test_next_version_rejects_non_semver():
+    with pytest.raises(release.ReleaseError, match="not semantic"):
+        release.next_version("v12.1-20260603105209", "minor")
+
+
+def test_refuses_a_tag_that_exists_locally(repo: Path):
+    """The local check is separate from the origin one and must not be dropped."""
+    git(repo, "tag", "v0.100.0")
+
+    with pytest.raises(release.ReleaseError, match="already exists locally"):
+        release.prepare(repo, "minor", recording_runner(repo))
+
+
+def test_roll_inserts_the_new_unreleased_above_the_release(repo: Path):
+    """Below is what the retired CI job did, and it misfiled a later entry."""
+    release.prepare(repo, "minor", recording_runner(repo))
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert text.index("## Unreleased") < text.index("## 0.100.0")
+    assert "- A thing worth releasing." in text.split("## 0.100.0", 1)[1]
+    assert release.unreleased_section(repo / "CHANGELOG.md") == ""
+
+
+def test_two_consecutive_releases_do_not_nest_headings(repo: Path):
+    release.prepare(repo, "minor", recording_runner(repo))
+
+    # A real new entry, so the empty-Unreleased guard does not reject release two.
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    text = text.replace("## Unreleased\n", "## Unreleased\n\n- Something new.\n", 1)
+    (repo / "CHANGELOG.md").write_text(text, encoding="utf-8")
+    git(repo, "commit", "-aqm", "more news")
+
+    release.prepare(repo, "patch", recording_runner(repo))
+    final = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    assert final.count("## Unreleased") == 1
+    assert final.index("## Unreleased") < final.index("## 0.100.1")
+    assert final.index("## 0.100.1") < final.index("## 0.100.0")
+
+
+def test_the_full_gate_and_build_sets_are_present():
+    """Narrowing pytest, or dropping `clean`, would otherwise pass unnoticed."""
+    assert release.GATES == (
+        (sys.executable, "-m", "pytest", "tests/", "--ignore=tests/test_live_vice.py"),
+        ("bats", "test/import-prg.bats"),
+    )
+    assert release.BUILD == (
+        ("./gradlew", "--no-daemon", "clean", "buildExtension"),
+    )
