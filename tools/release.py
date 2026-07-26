@@ -40,6 +40,7 @@ DEFAULT_BRANCH = "master"
 # local paths included.
 MANIFEST_PATH = Path("dist") / "release-manifest.json"
 CHECKSUMS_PATH = Path("dist") / "SHA256SUMS"
+NOTES_PATH = Path("dist") / "release-notes.md"
 
 # Releases are this project's only distribution channel: building requires JDK 21,
 # Gradle and a full Ghidra install, so the asset is how anyone else installs it.
@@ -212,11 +213,13 @@ def head_sha(repo_root: Path, runner: Runner = run) -> str:
     return runner(["git", "rev-parse", "HEAD"], repo_root).strip()
 
 
-def ensure_in_sync_with_origin(repo_root: Path, runner: Runner = run) -> None:
-    """Refuse unless the branch matches origin exactly.
+def ensure_in_sync_with_origin(repo_root: Path, runner: Runner = run) -> str:
+    """Refuse unless the branch matches origin exactly; return origin's SHA.
 
     Releasing something the remote does not have, or missing something it does,
-    produces a tag whose contents nobody else can reproduce.
+    produces a tag whose contents nobody else can reproduce. The returned SHA
+    becomes the lease for the push, so movement between here and there is caught
+    rather than merely being unlikely.
     """
     runner(["git", "fetch", "--quiet", "origin", DEFAULT_BRANCH], repo_root)
     ahead_behind = runner(
@@ -232,6 +235,9 @@ def ensure_in_sync_with_origin(repo_root: Path, runner: Runner = run) -> None:
             f"HEAD is {ahead} ahead and {behind} behind origin/{DEFAULT_BRANCH}; "
             "push or pull first"
         )
+    return runner(
+        ["git", "rev-parse", f"origin/{DEFAULT_BRANCH}"], repo_root
+    ).strip()
 
 
 def ensure_tag_absent(repo_root: Path, tag: str, runner: Runner = run) -> None:
@@ -301,10 +307,18 @@ def write_manifest(
 
 def read_manifest(repo_root: Path) -> dict:
     path = repo_root / MANIFEST_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.is_file():
         raise ReleaseError(f"{MANIFEST_PATH} is missing; run prepare first")
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ReleaseError(f"{MANIFEST_PATH} is not valid JSON: {error}") from error
+    # Validated here so a malformed file is a refusal rather than a KeyError
+    # surfacing from wherever it happens to be indexed.
+    missing = {"version", "commit", "artifacts"} - set(manifest)
+    if missing:
+        raise ReleaseError(f"{MANIFEST_PATH} is missing {sorted(missing)}")
+    return manifest
 
 
 def verify_manifest(
@@ -419,6 +433,49 @@ def verify_artifact_contents(repo_root: Path, version: str) -> list[Artifact]:
 # ------------------------------------------------------------------------ prepare
 
 
+@dataclass(frozen=True)
+class PublishPlan:
+    """Everything publishing needs, computed before anything is pushed."""
+
+    version: str
+    tag: str
+    repo: str
+    notes_path: Path
+    assets: tuple[Path, ...]
+
+
+def build_publish_plan(repo_root: Path, version: str, runner: Runner = run) -> PublishPlan:
+    """Do all the local, fallible publication work.
+
+    Deliberately called before the push: reading the manifest, verifying hashes,
+    writing checksums and parsing the origin URL can all fail, and after a push
+    a failure leaves a public tag that this script cannot retract.
+    """
+    tag = f"v{version}"
+    commit = head_sha(repo_root, runner)
+    manifest = read_manifest(repo_root)
+    if manifest["version"] != version:
+        raise ReleaseError(f"manifest is for {manifest['version']}, not {version}")
+    artifacts = verify_manifest(repo_root, manifest, commit, version)
+    checksums = write_checksums(repo_root, artifacts)
+
+    # The tag body, captured locally: `gh release create` refuses
+    # --notes-from-tag together with --repo, and --repo is not negotiable
+    # because gh otherwise resolves through the wrong remote here.
+    body = runner(["git", "tag", "-l", "--format=%(contents)", tag], repo_root).strip()
+    notes_path = repo_root / NOTES_PATH
+    notes_path.parent.mkdir(parents=True, exist_ok=True)
+    notes_path.write_text((body or version) + "\n", encoding="utf-8")
+
+    return PublishPlan(
+        version=version,
+        tag=tag,
+        repo=origin_repo(repo_root, runner),
+        notes_path=notes_path,
+        assets=(*artifacts, checksums),
+    )
+
+
 def release(repo_root: Path, bump: str, runner: Runner = run) -> str:
     """Cut and publish a release in one command."""
     ensure_default_branch(repo_root, runner)
@@ -427,18 +484,31 @@ def release(repo_root: Path, bump: str, runner: Runner = run) -> str:
     resumed = resumable_version(repo_root, runner)
     if resumed is not None:
         print(f"v{resumed} is already tagged and pushed; publishing only")
-        return publish(repo_root, runner)
+        return publish(repo_root, build_publish_plan(repo_root, resumed, runner), runner)
 
-    ensure_in_sync_with_origin(repo_root, runner)
+    origin_sha = ensure_in_sync_with_origin(repo_root, runner)
     version = prepare(repo_root, bump, runner)
-    tag = f"v{version}"
+    plan = build_publish_plan(repo_root, version, runner)
 
-    # The one-way door. Everything that can fail has already run.
-    print(f"push: origin HEAD and {tag}")
-    runner(["git", "push", "origin", "HEAD"], repo_root)
-    runner(["git", "push", "origin", tag], repo_root)
+    # The one-way door. Everything fallible and local has already run.
+    #
+    # One atomic push, leased against the SHA the sync check saw: separate pushes
+    # can leave origin holding the release commit without its tag, which no later
+    # run can resume or redo cleanly. The lease also catches a concurrent rewind,
+    # which a plain non-fast-forward check does not.
+    print(f"push: origin HEAD and {plan.tag} (atomic)")
+    runner(
+        [
+            "git", "push", "--atomic",
+            f"--force-with-lease=refs/heads/{DEFAULT_BRANCH}:{origin_sha}",
+            "origin",
+            f"HEAD:refs/heads/{DEFAULT_BRANCH}",
+            f"refs/tags/{plan.tag}",
+        ],
+        repo_root,
+    )
 
-    return publish(repo_root, runner)
+    return publish(repo_root, plan, runner)
 
 
 def resumable_version(repo_root: Path, runner: Runner = run) -> str | None:
@@ -552,56 +622,68 @@ def _rollback(
 # ------------------------------------------------------------------------ publish
 
 
-def publish(repo_root: Path, runner: Runner = run) -> str:
-    tag = runner(["git", "describe", "--tags", "--exact-match", "HEAD"], repo_root).strip()
-    if not tag.startswith("v"):
-        raise ReleaseError(f"HEAD tag {tag!r} is not a release tag")
-    version = tag[1:]
-    if _SEMVER_RE.fullmatch(version) is None:
-        raise ReleaseError(f"HEAD tag {tag!r} is not semantic")
+def publish(repo_root: Path, plan: PublishPlan, runner: Runner = run) -> str:
+    """Create the GitHub release, or accept one that is already correct.
 
-    commit = head_sha(repo_root, runner)
-    peeled = runner(
-        ["git", "ls-remote", "origin", f"refs/tags/{tag}^{{}}"], repo_root
-    ).split()
-    if not peeled or peeled[0] != commit:
+    Idempotent on purpose: a pushed tag does not prove the release was never
+    created. A run whose `create` succeeded and whose verification then failed
+    leaves exactly that state, and calling `create` again would fail on a release
+    that is already right.
+    """
+    expected = sorted(path.name for path in plan.assets)
+    existing = _existing_release_assets(repo_root, plan, runner)
+
+    if existing is None:
+        runner(
+            [
+                "gh", "release", "create", plan.tag,
+                "--repo", plan.repo,
+                "--verify-tag",
+                "--title", f"{PRODUCT} {plan.version}",
+                # --notes-file, not --notes-from-tag: gh refuses the latter
+                # together with --repo, and --repo must stay.
+                "--notes-file", str(plan.notes_path),
+                f"--latest={'true' if MARK_LATEST else 'false'}",
+                *[str(path) for path in plan.assets],
+            ],
+            repo_root,
+        )
+    elif existing == expected:
+        print(f"{plan.tag} is already published with the expected assets")
+        return plan.version
+    else:
         raise ReleaseError(
-            f"origin has no {tag} pointing at {commit[:12]}; push the branch and tag first"
+            f"{plan.tag} already exists on {plan.repo} with assets {existing}, "
+            f"not {expected}; inspect and fix it by hand"
         )
 
-    manifest = read_manifest(repo_root)
-    if manifest["version"] != version:
+    listed = _existing_release_assets(repo_root, plan, runner)
+    if listed != expected:
         raise ReleaseError(
-            f"manifest is for {manifest['version']}, not {version}"
+            f"released assets {listed} do not match expected {expected}"
         )
-    artifacts = verify_manifest(repo_root, manifest, commit, version)
-    checksums = write_checksums(repo_root, artifacts)
+    print(f"published {plan.tag} to {plan.repo}")
+    return plan.version
 
-    repo = origin_repo(repo_root, runner)
-    command = [
-        "gh", "release", "create", tag,
-        "--repo", repo,
-        "--verify-tag",
-        "--title", f"{PRODUCT} {version}",
-        # From the tag: the working-tree changelog can drift after tagging.
-        "--notes-from-tag",
-        f"--latest={'true' if MARK_LATEST else 'false'}",
-        *[str(path) for path in [*artifacts, checksums]],
-    ]
-    runner(command, repo_root)
 
-    listed = runner(
-        ["gh", "release", "view", tag, "--repo", repo, "--json", "assets",
-         "--jq", ".assets[].name"],
-        repo_root,
-    ).split()
-    expected = sorted(path.name for path in [*artifacts, checksums])
-    if sorted(listed) != expected:
-        raise ReleaseError(
-            f"released assets {sorted(listed)} do not match expected {expected}"
+def _existing_release_assets(
+    repo_root: Path, plan: PublishPlan, runner: Runner = run
+) -> list[str] | None:
+    """Asset names of an existing release, or None when there is no release."""
+    try:
+        listed = runner(
+            ["gh", "release", "view", plan.tag, "--repo", plan.repo,
+             "--json", "assets", "--jq", ".assets[].name"],
+            repo_root,
         )
-    print(f"published {tag} to {repo}")
-    return version
+    except ReleaseError as error:
+        # Only "not found" means there is no release. Swallowing every failure
+        # would report a transport error or a permissions problem as absence, and
+        # then try to create a release that may already exist.
+        if "not found" in str(error).lower():
+            return None
+        raise
+    return sorted(listed.split())
 
 
 # ---------------------------------------------------------------------------- cli
