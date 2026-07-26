@@ -532,6 +532,11 @@ def on_resume():
 
 def sync_event(event, remaining_ms):
     """Synchronize one ordered controller event into the trace."""
+    if event.kind == "checkpoint_hit":
+        # A non-stopping checkpoint hit leaves VICE running. Synchronizing here
+        # would require a monitor command, and every monitor command stops the
+        # emulator — so this is deliberately a no-op that takes no snapshot.
+        return None
     if event.kind == "stopped":
         on_stop(remaining_ms)
     elif event.kind == "resumed":
