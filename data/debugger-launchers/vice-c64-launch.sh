@@ -15,6 +15,7 @@
 #@env OPT_PRG_FILE:file="" "PRG image" "Optional .prg program to autostart, empty to just boot BASIC"
 #@env OPT_HOST:str="127.0.0.1" "Monitor host" "Address the binary monitor binds to"
 #@env OPT_PORT:int=6502 "Monitor port" "Binary Monitor TCP port (VICE default: 6502)"
+#@env OPT_MUTE_AUDIO:bool=true "Mute audio output" "Run VICE silently. SID emulation is unaffected, so register-level audio debugging still works; only the host output is silenced."
 #@env OPT_EXTRA_VICE_ARGS:str="" "Extra VICE args" "Additional arguments passed to VICE"
 #@env OPT_PYTHON_EXE:file="python3" "Python command" "Path to the Python 3 interpreter"
 #@env OPT_LOG_FILE:file="/tmp/vice-agent.log" "Log file" "Agent log file path"
@@ -39,6 +40,14 @@ VENV_SITE="$("$OPT_PYTHON_EXE" -c 'import site; print(site.getsitepackages()[0])
 export PYTHONPATH="$pypathVice:$VENV_SITE:$pypathTrace:$PYTHONPATH"
 
 vice_args=(-binarymonitor -binarymonitoraddress "$OPT_HOST:$OPT_PORT")
+# Zero final output gain while leaving SID emulation and monitor-visible register
+# state active. Placed before OPT_EXTRA_VICE_ARGS: VICE takes
+# the last of a repeated resource option, so a caller can override the volume
+# there. Defaulted here as well as in the metadata, so a saved launch config from
+# before this option existed still starts muted rather than silently audible.
+if [ "${OPT_MUTE_AUDIO:-true}" = "true" ]; then
+  vice_args+=(-soundvolume 0)
+fi
 if [ -n "$OPT_EXTRA_VICE_ARGS" ]; then
   vice_args+=($OPT_EXTRA_VICE_ARGS)
 fi
