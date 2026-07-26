@@ -12,7 +12,7 @@ API_MINOR = 0
 SURFACE_REVISION = 1
 METHOD_NAMESPACE = "c64_vice_v1_"
 CONNECTOR_NAME = "ghidra-vice-connector"
-CONNECTOR_VERSION = "1.0.0"
+CONNECTOR_VERSION = "0.99.0"
 
 CAPABILITIES = (
     "status",
@@ -141,9 +141,13 @@ def build_contract() -> Dict[str, Any]:
         "api": {"major": API_MAJOR, "minor": API_MINOR},
         "surface_revision": SURFACE_REVISION,
         "method_namespace": METHOD_NAMESPACE,
+        # Only the connector's identity belongs in the contract. Its release
+        # version is runtime metadata -- returned by status, and embedded in the
+        # packaged extension -- so keeping it here would force a coordinated
+        # commit in ghidra-mcp-c64 on every release, enforced only by an opt-in
+        # test, which is silent drift waiting to happen.
         "connector": {
             "name": CONNECTOR_NAME,
-            "version": CONNECTOR_VERSION,
         },
         "machine": "c64",
         "capabilities": list(CAPABILITIES),

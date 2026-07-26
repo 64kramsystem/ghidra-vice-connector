@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Versioning moves to semantic versions, starting at `0.99.0`. `CONNECTOR_VERSION`
+  in `contracts.py` is the source of truth, and the packaged extension now carries
+  it as `connectorVersion` so an installed copy can be identified without a
+  running connection. `extension.properties`' own `version` field is still
+  Ghidra's, substituted from `application.version`, because the installer gates on
+  exactly that.
+- Removed `connector.version` from the published API contract. It is release
+  metadata rather than part of the `c64.vice/1` compatibility surface — nothing
+  compares it — and keeping it there forced a coordinated commit in
+  `ghidra-mcp-c64` on every release, enforced only by an opt-in test. The version
+  is still returned by `status` and capabilities.
+
 - Fixed a protocol error raised when more than one checkpoint-info event arrived
   before a stopped event. VICE reports every matching checkpoint at an address,
   so both a repeatedly-firing non-stopping checkpoint and two overlapping

@@ -8,7 +8,7 @@ import pytest
 
 from ghidratrace import sch
 
-from vice import automation, commands, methods
+from vice import automation, commands, contracts, methods
 from vice.contracts import METHODS, contract_json
 from vice.controller import OperationResult, PublicEvent
 from vice.protocol import ViceValidationError
@@ -169,3 +169,26 @@ def test_unexpected_defect_propagates(controller):
     controller.list_banks.side_effect = AssertionError("bug")
     with pytest.raises(AssertionError, match="bug"):
         automation.list_banks(process(), 1000)
+
+
+def test_contract_declares_identity_without_the_release_version():
+    """The contract names the connector; its release version is runtime metadata.
+
+    Keeping the version here would force a coordinated commit in ghidra-mcp-c64
+    on every release, enforced only by an opt-in test -- silent drift. Nothing
+    compares it for compatibility, which is decided by api/machine/namespace/
+    surface_revision/binary_monitor_api.
+    """
+    contract = contracts.build_contract()
+
+    assert contract["connector"] == {"name": "ghidra-vice-connector"}
+    assert "version" not in contract["connector"]
+
+
+def test_status_reports_the_declared_connector_version(controller):
+    """Runtime status remains the place the version is published."""
+    status = payload(automation.status(process()))
+
+    assert status["ok"] is True
+    assert status["result"]["connector_version"] == contracts.CONNECTOR_VERSION
+    assert status["result"]["connector_version"] == "0.99.0"

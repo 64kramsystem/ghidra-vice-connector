@@ -21,6 +21,21 @@ repositories {
 dependencies {
 }
 
+// The connector's release version lives in contracts.py, which is what it serves
+// over the wire. Read it here so the packaged extension carries the same number
+// and an installed copy can be identified without a running connection.
+// extension.properties' own `version` is left to Ghidra: buildExtension.gradle
+// substitutes @extversion@ from application.version, and the installer gates on
+// exactly that field.
+def connectorVersion = {
+    def declaration = file('src/main/py/src/vice/contracts.py').text
+    def match = declaration =~ /(?m)^CONNECTOR_VERSION = "([^"]+)"$/
+    if (!match.find()) {
+        throw new GradleException('CONNECTOR_VERSION not found in contracts.py')
+    }
+    return match.group(1)
+}()
+
 // Preserve executable bit on shell launcher scripts in the zip.
 // Exclude Python bytecode, test artifacts, and dev files from the extension zip.
 tasks.named('buildExtension') {
@@ -47,5 +62,12 @@ tasks.named('buildExtension') {
     }
     from('contracts') {
         into "${project.name}/contracts"
+    }
+
+    // Appended to the packaged copy only; the source file stays untouched.
+    filesMatching('**/extension.properties') {
+        filter { line ->
+            line.startsWith('version=') ? "${line}\nconnectorVersion=${connectorVersion}" : line
+        }
     }
 }
