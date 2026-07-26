@@ -29,7 +29,11 @@ from typing import Callable, Iterable, Sequence
 
 PRODUCT = "ghidra-vice-connector"
 DEFAULT_BRANCH = "master"
-MANIFEST_NAME = ".release-manifest.json"
+# Under dist/: ignored by git, and dist/ is not copied into the extension.
+# A root-level manifest was demonstrably packaged into the zip, absolute
+# local paths included.
+MANIFEST_PATH = Path("dist") / "release-manifest.json"
+CHECKSUMS_PATH = Path("dist") / "SHA256SUMS"
 
 # Releases are this project's only distribution channel: building requires JDK 21,
 # Gradle and a full Ghidra install, so the asset is how anyone else installs it.
@@ -248,7 +252,8 @@ def sha256(path: Path) -> str:
 def write_manifest(
     repo_root: Path, version: str, commit: str, artifacts: Iterable[Artifact]
 ) -> Path:
-    path = repo_root / MANIFEST_NAME
+    path = repo_root / MANIFEST_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
@@ -266,13 +271,16 @@ def write_manifest(
 
 
 def read_manifest(repo_root: Path) -> dict:
-    path = repo_root / MANIFEST_NAME
+    path = repo_root / MANIFEST_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
     if not path.is_file():
         raise ReleaseError(f"{MANIFEST_NAME} is missing; run prepare first")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def verify_manifest(repo_root: Path, manifest: dict, commit: str) -> list[Path]:
+def verify_manifest(
+    repo_root: Path, manifest: dict, commit: str, version: str
+) -> list[Path]:
     """Confirm the prepared artifacts are still the ones being published.
 
     Hash-checked, not name-checked: an artifact rebuilt from a different commit
@@ -281,6 +289,13 @@ def verify_manifest(repo_root: Path, manifest: dict, commit: str) -> list[Path]:
     if manifest["commit"] != commit:
         raise ReleaseError(
             f"manifest commit {manifest['commit'][:12]} is not the tagged commit {commit[:12]}"
+        )
+    canonical = expected_artifacts(repo_root, version)
+    listed = sorted(Path(entry["path"]).name for entry in manifest["artifacts"])
+    if listed != sorted(path.name for path in canonical):
+        raise ReleaseError(
+            f"manifest lists {listed}, not the expected "
+            f"{sorted(path.name for path in canonical)}"
         )
     paths = []
     for entry in manifest["artifacts"]:
@@ -298,7 +313,8 @@ def verify_manifest(repo_root: Path, manifest: dict, commit: str) -> list[Path]:
 
 
 def write_checksums(repo_root: Path, artifacts: Sequence[Path]) -> Path:
-    path = repo_root / "SHA256SUMS"
+    path = repo_root / CHECKSUMS_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines = sorted(f"{sha256(item)}  {item.name}" for item in artifacts)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
@@ -356,14 +372,17 @@ def verify_artifact_contents(repo_root: Path, version: str) -> list[Artifact]:
                 f"{extension.name} does not carry connectorVersion={version}"
             )
         # buildExtension.gradle copies the project root, so the changelog ships.
-        # It must be the rolled one: building before the roll would publish an
-        # artifact reading "## Unreleased" under a tag naming the version.
-        if changelog_name in names:
-            packaged = archive.read(changelog_name).decode("utf-8")
-            if packaged != (repo_root / "CHANGELOG.md").read_text(encoding="utf-8"):
-                raise ReleaseError(
-                    f"{extension.name} bundles a stale CHANGELOG.md"
-                )
+        # Absence is a failure, not a pass: tolerating it would mean a packaging
+        # change that dropped the file silently disabled this check.
+        if changelog_name not in names:
+            raise ReleaseError(f"{extension.name} has no {changelog_name}")
+        packaged = archive.read(changelog_name).decode("utf-8")
+        if packaged != (repo_root / "CHANGELOG.md").read_text(encoding="utf-8"):
+            raise ReleaseError(f"{extension.name} bundles a stale CHANGELOG.md")
+        # The release scratch files must never be packaged.
+        for helper in (MANIFEST_PATH.name, CHECKSUMS_PATH.name):
+            if any(name.endswith(f"/{helper}") for name in names):
+                raise ReleaseError(f"{extension.name} packages {helper}")
 
     return [Artifact(extension, sha256(extension))]
 
@@ -385,8 +404,8 @@ def prepare(repo_root: Path, bump: str, runner: Runner = run) -> str:
     ensure_tag_absent(repo_root, tag, runner)
 
     print(f"{current} -> {version}")
-    committed = False
-    manifest_path = repo_root / MANIFEST_NAME
+    release_commit: str | None = None
+    manifest_path = repo_root / MANIFEST_PATH
     try:
         written = [*write_version(repo_root, version), changelog]
         roll_changelog(changelog, version)
@@ -405,8 +424,8 @@ def prepare(repo_root: Path, bump: str, runner: Runner = run) -> str:
         staged = [str(path.relative_to(repo_root)) for path in written]
         runner(["git", "add", *staged], repo_root)
         runner(["git", "commit", "-m", f"Release {version}"], repo_root)
-        committed = True
         commit = head_sha(repo_root, runner)
+        release_commit = commit
 
         write_manifest(repo_root, version, commit, artifacts)
         runner(
@@ -414,7 +433,7 @@ def prepare(repo_root: Path, bump: str, runner: Runner = run) -> str:
             repo_root,
         )
     except BaseException:
-        _rollback(repo_root, original_head, committed, manifest_path, runner)
+        _rollback(repo_root, original_head, release_commit, manifest_path, runner)
         raise
 
     print(f"\nprepared {tag}. Now:\n  git push origin HEAD\n  git push origin {tag}\n  tools/release publish")
@@ -435,18 +454,23 @@ def unreleased_or_version(changelog: Path, version: str) -> str:
 def _rollback(
     repo_root: Path,
     original_head: str,
-    committed: bool,
+    release_commit: str | None,
     manifest_path: Path,
     runner: Runner,
 ) -> None:
     """Restore worktree, index and refs. A failed release must be a no-op."""
     if manifest_path.exists():
         manifest_path.unlink()
-    if committed:
-        # Only move the branch if HEAD is still the commit this run created.
+    if release_commit is not None:
         current = head_sha(repo_root, runner)
-        if current != original_head:
+        if current == release_commit:
             runner(["git", "reset", "--hard", original_head], repo_root)
+        else:
+            # Something else advanced HEAD; resetting would destroy that work.
+            raise ReleaseError(
+                f"HEAD moved to {current[:12]} after the release commit "
+                f"{release_commit[:12]}; not resetting. Undo manually."
+            )
     else:
         # Unstage anything the failed commit left in the index, then restore the
         # tracked files. `reset --hard` is confined to tracked content, so build
@@ -480,17 +504,17 @@ def publish(repo_root: Path, runner: Runner = run) -> str:
         raise ReleaseError(
             f"manifest is for {manifest['version']}, not {version}"
         )
-    artifacts = verify_manifest(repo_root, manifest, commit)
+    artifacts = verify_manifest(repo_root, manifest, commit, version)
     checksums = write_checksums(repo_root, artifacts)
 
     repo = origin_repo(repo_root, runner)
-    notes = unreleased_or_version(repo_root / "CHANGELOG.md", version)
     command = [
         "gh", "release", "create", tag,
         "--repo", repo,
         "--verify-tag",
         "--title", f"{PRODUCT} {version}",
-        "--notes", notes,
+        # From the tag: the working-tree changelog can drift after tagging.
+        "--notes-from-tag",
         f"--latest={'true' if MARK_LATEST else 'false'}",
         *[str(path) for path in [*artifacts, checksums]],
     ]

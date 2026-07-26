@@ -23,6 +23,3 @@ __pycache__/
 Thumbs.db
 data/test_raw.bin
 data/ghidra-project/
-
-# Written by tools/release prepare; consumed by publish.
-.release-manifest.json
