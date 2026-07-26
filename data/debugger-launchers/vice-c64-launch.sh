@@ -39,7 +39,16 @@ VENV_SITE="$("$OPT_PYTHON_EXE" -c 'import site; print(site.getsitepackages()[0])
 
 export PYTHONPATH="$pypathVice:$VENV_SITE:$pypathTrace:$PYTHONPATH"
 
-vice_args=(-binarymonitor -binarymonitoraddress "$OPT_HOST:$OPT_PORT")
+# VICE needs a scheme-qualified bind address. Handed a bare "HOST:PORT" it binds nothing
+# and reports no error at all (observed on VICE 3.10), so the port wait below spins for its
+# full 30 seconds and the launch fails with a timeout that blames the port rather than the
+# argument. VICE documents the ip4:// and ip6:// forms; only the bind address needs them —
+# the client-side connects below stay plain host and port.
+case "$OPT_HOST" in
+  *:*) monitor_bind="ip6://[$OPT_HOST]:$OPT_PORT" ;;
+  *)   monitor_bind="ip4://$OPT_HOST:$OPT_PORT" ;;
+esac
+vice_args=(-binarymonitor -binarymonitoraddress "$monitor_bind")
 # Zero final output gain while leaving SID emulation and monitor-visible register
 # state active. Placed before OPT_EXTRA_VICE_ARGS: VICE takes
 # the last of a repeated resource option, so a caller can override the volume

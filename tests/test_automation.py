@@ -102,7 +102,7 @@ def test_capabilities_and_status_are_cached(controller):
     status = payload(automation.status(process()))
     assert capabilities["ok"] is True
     assert capabilities["result"]["vice_version"] == "3.10.0"
-    assert capabilities["result"]["surface_revision"] == 1
+    assert capabilities["result"]["surface_revision"] == 2
     assert status["ok"] is True
     controller.get_registers.assert_not_called()
     controller.client.command.assert_not_called()

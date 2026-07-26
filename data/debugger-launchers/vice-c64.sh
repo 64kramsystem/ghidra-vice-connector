@@ -3,7 +3,7 @@
 #@desc <html><body width="300px">
 #@desc   <h3>Connect to VICE C64 via Binary Monitor Protocol</h3>
 #@desc   <p>Start VICE with:</p>
-#@desc   <p><tt>x64 -binarymonitor -binarymonitoraddress HOST:PORT</tt></p>
+#@desc   <p><tt>x64 -binarymonitor -binarymonitoraddress ip4://HOST:PORT</tt></p>
 #@desc   <p>then launch this connector.</p>
 #@desc </body></html>
 #@menu-group vice

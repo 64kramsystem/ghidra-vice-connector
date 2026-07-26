@@ -17,6 +17,7 @@ from vice.protocol import (
     RESP_RESUMED,
     RESP_STOPPED,
     ViceConnectionError,
+    ViceInfo,
     ViceTimeoutError,
     ViceValidationError,
 )
@@ -52,7 +53,7 @@ class FakeClient:
         self.connected = True
 
     def vice_info(self):
-        return "3.10.0"
+        return ViceInfo((3, 10, 0, 0), None)
 
     def banks_available(self, timeout_ms=10_000):
         return []

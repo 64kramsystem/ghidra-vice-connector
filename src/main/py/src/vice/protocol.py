@@ -46,7 +46,9 @@ CMD_EXECUTE_UNTIL_RETURN = 0x73
 CMD_PING = 0x81
 CMD_BANKS_AVAILABLE = 0x82
 CMD_REGISTERS_AVAILABLE = 0x83
+CMD_DISPLAY_GET = 0x84
 CMD_VICE_INFO = 0x85
+CMD_PALETTE_GET = 0x91
 CMD_EXIT = 0xAA
 CMD_QUIT = 0xBB
 CMD_RESET = 0xCC
@@ -65,9 +67,30 @@ RESP_EXECUTE_UNTIL_RETURN = 0x73
 RESP_PING = 0x81
 RESP_BANKS_AVAILABLE = 0x82
 RESP_REGISTERS_AVAILABLE = 0x83
+RESP_DISPLAY_GET = 0x84
 RESP_VICE_INFO = 0x85
+RESP_PALETTE_GET = 0x91
 RESP_EXIT = 0xAA
 RESP_RESET = 0xCC
+
+# `display get` format selector: 0x00 is the only one VICE implements, one
+# palette index per byte.
+DISPLAY_FORMAT_INDEXED8 = 0x00
+# DW(2) DH(2) XO(2) YO(2) IW(2) IH(2) BP(1). Anything past this inside the
+# declared metadata length is a later addition and is skipped.
+DISPLAY_METADATA_SIZE = 13
+DISPLAY_BITS_PER_PIXEL = 8
+MAX_PALETTE_ITEMS = 256
+PALETTE_ITEM_SIZE = 3
+
+# VICE computed the 0x84 response length as `4 + info + buffer` while writing
+# `FL + info + BL + buffer`, four bytes more, so it wrote past its own
+# allocation *before* replying. Upstream fixed that in r46020; the fix postdates
+# the 3.10 release, so 3.11 is the first release family carrying it. A client
+# cannot make an affected build safe after the fact -- the overrun has already
+# happened -- so the command must never be sent to one.
+DISPLAY_GET_MIN_REVISION = 46020
+DISPLAY_GET_MIN_RELEASE = (3, 11)
 
 MEMSPACE_MAIN = 0
 MEMSPACE_DRIVE8 = 1
@@ -130,6 +153,18 @@ class ViceTimeoutError(ViceFailure):
 
 class ViceValidationError(ViceFailure):
     code = "vice_invalid_argument"
+
+
+class ViceUnsupportedBuildError(ViceFailure):
+    """The connected VICE build cannot be asked for this command.
+
+    Distinct from :class:`ViceValidationError`, which would read as a caller
+    mistake, and from :class:`ViceProtocolError`, which means VICE answered
+    something malformed. Here VICE answered perfectly well; the build it
+    described is one we refuse to send the command to.
+    """
+
+    code = "vice_unsupported_build"
 
 
 class VicePartialWriteError(ViceFailure):
@@ -197,6 +232,52 @@ class Register:
     name: str
     bits: int
     value: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ViceInfo:
+    """What VICE reports about itself.
+
+    `version` is every component VICE sent, not a truncated three-part string:
+    the build guard needs the release family, and the result surface publishes
+    the whole dotted version. `revision` is the Subversion revision, or `None`
+    for a release build -- which reports no revision at all, sending `SV` as
+    zero. `None` and `0` therefore mean the same thing on the wire and must not
+    be conflated with "revision 0".
+    """
+
+    version: Tuple[int, ...]
+    revision: Optional[int] = None
+
+    @property
+    def version_string(self) -> str:
+        return ".".join(str(component) for component in self.version)
+
+
+@dataclass(frozen=True)
+class DisplayFrame:
+    """One captured frame: an indexed buffer plus the geometry describing it.
+
+    `buffer` is row-major, one byte per pixel, each byte an index into the
+    palette returned by `palette get`. `width`/`height` describe the whole debug
+    buffer; the inner rectangle is the visible screen inside it.
+    """
+
+    width: int
+    height: int
+    x_offset: int
+    y_offset: int
+    inner_width: int
+    inner_height: int
+    bits_per_pixel: int
+    buffer: bytes
+
+
+@dataclass(frozen=True)
+class PaletteEntry:
+    r: int
+    g: int
+    b: int
 
 
 @dataclass(frozen=True)
@@ -331,6 +412,140 @@ def parse_checkpoint_info(body: bytes) -> Checkpoint:
 _parse_checkpoint_info = parse_checkpoint_info
 
 
+def parse_vice_info(body: bytes) -> ViceInfo:
+    """Parse a VICE_INFO body: VL, version bytes, SL, revision bytes.
+
+    Both fields are length-prefixed and variable width. The revision is little
+    endian, and zero means "this build has no revision", which every release
+    build reports.
+    """
+    cur = Cursor(body, "VICE info")
+    version = tuple(cur.take(cur.u8()))
+    revision_bytes = cur.take(cur.u8())
+    cur.finish()
+    if len(version) < 3:
+        raise ViceProtocolError("VICE version contains fewer than 3 components")
+    revision = int.from_bytes(revision_bytes, "little") if revision_bytes else 0
+    return ViceInfo(version, revision or None)
+
+
+def build_display_get_body(use_vic: bool = True) -> bytes:
+    """VC (use VIC-II; 0 selects the VDC, ignored except on a C128) then FM."""
+    return struct.pack("<BB", int(bool(use_vic)), DISPLAY_FORMAT_INDEXED8)
+
+
+def build_palette_get_body(use_vic: bool = True) -> bytes:
+    """VC alone; `palette get` takes no format selector."""
+    return struct.pack("<B", int(bool(use_vic)))
+
+
+def parse_display_get(body: bytes) -> DisplayFrame:
+    """Parse a DISPLAY_GET body into a validated frame.
+
+    Wire order is `FL`, `FL` bytes of `DW`..`BP` metadata, `BL`, then `BL`
+    buffer bytes. `FL` counts the metadata only -- it excludes both itself and
+    `BL` -- so it locates `BL`, not `BD`. Requiring `FL == 13` would throw away
+    the forward compatibility that reading `FL` buys, so a longer metadata block
+    is accepted and its unknown tail skipped.
+    """
+    cur = Cursor(body, "display get")
+    info_length = cur.u32()
+    if info_length < DISPLAY_METADATA_SIZE:
+        raise ViceProtocolError(
+            f"display get: metadata length {info_length} is shorter than the "
+            f"{DISPLAY_METADATA_SIZE}-byte DW..BP prefix"
+        )
+    info = Cursor(cur.take(info_length), "display get metadata")
+    width = info.u16()
+    height = info.u16()
+    x_offset = info.u16()
+    y_offset = info.u16()
+    inner_width = info.u16()
+    inner_height = info.u16()
+    bits_per_pixel = info.u8()
+    # Any remaining declared metadata is a later addition: skipped, not read.
+
+    if bits_per_pixel != DISPLAY_BITS_PER_PIXEL:
+        raise ViceProtocolError(
+            f"display get: bits per pixel {bits_per_pixel} is unsupported; "
+            f"the indexed format is {DISPLAY_BITS_PER_PIXEL} and the pixel "
+            f"arithmetic assumes one byte per pixel"
+        )
+    for name, value in (
+        ("debug width", width),
+        ("debug height", height),
+        ("inner width", inner_width),
+        ("inner height", inner_height),
+    ):
+        if value <= 0:
+            raise ViceProtocolError(
+                f"display get: {name} {value} must be positive"
+            )
+    if x_offset + inner_width > width:
+        raise ViceProtocolError(
+            f"display get: inner screen x offset {x_offset} plus inner width "
+            f"{inner_width} exceeds debug width {width}"
+        )
+    if y_offset + inner_height > height:
+        raise ViceProtocolError(
+            f"display get: inner screen y offset {y_offset} plus inner height "
+            f"{inner_height} exceeds debug height {height}"
+        )
+
+    buffer_length = cur.u32()
+    expected = width * height
+    if buffer_length != expected:
+        raise ViceProtocolError(
+            f"display get: buffer length {buffer_length} does not equal "
+            f"{width} x {height} = {expected} bytes at "
+            f"{DISPLAY_BITS_PER_PIXEL} bits per pixel"
+        )
+    if cur.remaining < buffer_length:
+        raise ViceProtocolError(
+            f"display get: declared buffer length {buffer_length} but only "
+            f"{cur.remaining} bytes were delivered"
+        )
+    buffer = cur.take(buffer_length)
+    cur.finish()
+    return DisplayFrame(
+        width,
+        height,
+        x_offset,
+        y_offset,
+        inner_width,
+        inner_height,
+        bits_per_pixel,
+        buffer,
+    )
+
+
+def parse_palette_get(body: bytes) -> List[PaletteEntry]:
+    """Parse a PALETTE_GET body: PC, then PC items of IS, RR, GG, BB.
+
+    `IS` excludes itself. Items longer than three bytes are accepted and their
+    declared remainder skipped, the same forward-compatible policy `FL` gets.
+    """
+    cur = Cursor(body, "palette get")
+    count = cur.u16()
+    if not 1 <= count <= MAX_PALETTE_ITEMS:
+        raise ViceProtocolError(
+            f"palette get: item count {count} is outside 1..{MAX_PALETTE_ITEMS}"
+        )
+    entries: List[PaletteEntry] = []
+    for index in range(count):
+        item_size = cur.u8()
+        if item_size < PALETTE_ITEM_SIZE:
+            raise ViceProtocolError(
+                f"palette get: item {index} declares size {item_size}, "
+                f"smaller than the {PALETTE_ITEM_SIZE}-byte RGB record"
+            )
+        item = Cursor(cur.take(item_size), f"palette get item {index}")
+        entries.append(PaletteEntry(item.u8(), item.u8(), item.u8()))
+        # The declared remainder is a later addition: skipped, not read.
+    cur.finish()
+    return entries
+
+
 def _validate_u16(value: int, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFF:
         raise ViceValidationError(f"{field} must be an integer in 0..65535")
@@ -385,6 +600,9 @@ class ViceBmpClient:
         self._raw_sequence = 0
         self._pending_checkpoints: List[Checkpoint] = []
         self._diagnostics = collections.deque(maxlen=diagnostic_limit)
+        # Build information for the 0x84 guard. Absent until VICE_INFO has been
+        # read on *this* connection, and absent means refuse.
+        self._vice_info: Optional[ViceInfo] = None
         self.reg_name_to_id: Dict[str, int] = {}
         self.reg_id_to_name: Dict[int, str] = {}
         self.reg_name_to_bits: Dict[str, int] = {}
@@ -404,6 +622,12 @@ class ViceBmpClient:
         with self._state_lock:
             return tuple(self._diagnostics)
 
+    @property
+    def vice_build_info(self) -> Optional[ViceInfo]:
+        """The build record for this connection, or `None` if none was read."""
+        with self._state_lock:
+            return self._vice_info
+
     def set_event_callback(self, callback: Callable[[RawEvent], None]) -> None:
         with self._state_lock:
             self._event_callback = callback
@@ -421,6 +645,9 @@ class ViceBmpClient:
                     raise ViceValidationError("VICE client is already connected")
                 self._terminal_error = None
                 self._pending_checkpoints = []
+                # A record from an earlier session says nothing about the
+                # emulator we are about to talk to.
+                self._vice_info = None
                 self._sock = socket.create_connection(
                     (self.host, self.port), timeout=10
                 )
@@ -466,6 +693,7 @@ class ViceBmpClient:
                 return
             self._terminal_error = error
             self._running = False
+            self._vice_info = None
             sock, self._sock = self._sock, None
             pending = list(self._pending.values())
             self._pending.clear()
@@ -1201,19 +1429,100 @@ class ViceBmpClient:
         cur.finish()
         return result
 
-    def vice_info(self, *, timeout_ms: int = 10_000) -> str:
+    def vice_info(self, *, timeout_ms: int = 10_000) -> ViceInfo:
+        """Read and cache what VICE reports about itself.
+
+        The full version components and the revision are both returned: the
+        0x84 build guard is decided from them, and a truncated
+        "major.minor.build" string cannot express either the release family or
+        the revision it needs.
+        """
         frame = self.command(
             CMD_VICE_INFO, expected=RESP_VICE_INFO, timeout_ms=timeout_ms
         )
-        cur = Cursor(frame.body, "VICE info")
-        version_length = cur.u8()
-        version = cur.take(version_length)
-        svn_length = cur.u8()
-        cur.take(svn_length)
-        cur.finish()
-        if len(version) < 3:
-            raise ViceProtocolError("VICE version contains fewer than 3 components")
-        return ".".join(str(value) for value in version[:3])
+        info = parse_vice_info(frame.body)
+        with self._state_lock:
+            self._vice_info = info
+        return info
+
+    def _require_display_get_support(self) -> ViceInfo:
+        """Refuse `display get` unless this build is known to carry r46020.
+
+        Ordered so the revision wins wherever it exists: a build that reports
+        one is judged by it, and only a release build -- which reports none --
+        falls through to its version. Unknown build information refuses; the
+        guard must not fall open, because the damage from guessing wrong is an
+        out-of-bounds write inside the emulator.
+        """
+        info = self.vice_build_info
+        if info is None:
+            raise ViceUnsupportedBuildError(
+                "VICE build information is unknown on this connection, so "
+                "display capture is refused: builds before r46020 overrun "
+                "their own allocation while answering the command"
+            )
+        requirement = (
+            f"a build at r{DISPLAY_GET_MIN_REVISION} or later, or release "
+            f"{DISPLAY_GET_MIN_RELEASE[0]}.{DISPLAY_GET_MIN_RELEASE[1]} or later"
+        )
+        detected = (
+            f"VICE version {info.version_string or '(none)'} revision "
+            f"{'none' if info.revision is None else 'r%d' % info.revision}"
+        )
+        if info.revision is not None:
+            if info.revision < DISPLAY_GET_MIN_REVISION:
+                raise ViceUnsupportedBuildError(
+                    f"{detected} predates the display-capture fix; "
+                    f"display capture requires {requirement}"
+                )
+            return info
+        # A release build. Compare exactly two components: in Python
+        # `(3, 10, 0, 0) > (3, 10)` is True, which would admit the vulnerable
+        # 3.10 release itself.
+        if len(info.version) < 2:
+            raise ViceUnsupportedBuildError(
+                f"{detected} does not identify a release family; "
+                f"display capture requires {requirement}"
+            )
+        if (info.version[0], info.version[1]) < DISPLAY_GET_MIN_RELEASE:
+            raise ViceUnsupportedBuildError(
+                f"{detected} predates the display-capture fix; "
+                f"display capture requires {requirement}"
+            )
+        return info
+
+    def display_get(
+        self, use_vic: bool = True, *, timeout_ms: int = 10_000
+    ) -> DisplayFrame:
+        """Fetch one indexed frame buffer and its geometry.
+
+        The build guard runs here, immediately before the command can be sent,
+        rather than only in the caller: an affected VICE performs the
+        out-of-bounds write before it replies, so there is no recovery at this
+        end and no second door into the command.
+        """
+        _validate_bool(use_vic, "use_vic")
+        self._require_display_get_support()
+        frame = self.command(
+            CMD_DISPLAY_GET,
+            build_display_get_body(use_vic),
+            expected=RESP_DISPLAY_GET,
+            timeout_ms=timeout_ms,
+        )
+        return parse_display_get(frame.body)
+
+    def palette_get(
+        self, use_vic: bool = True, *, timeout_ms: int = 10_000
+    ) -> List[PaletteEntry]:
+        """Fetch the palette the frame buffer's indices refer to."""
+        _validate_bool(use_vic, "use_vic")
+        frame = self.command(
+            CMD_PALETTE_GET,
+            build_palette_get_body(use_vic),
+            expected=RESP_PALETTE_GET,
+            timeout_ms=timeout_ms,
+        )
+        return parse_palette_get(frame.body)
 
     def ping(self, *, timeout_ms: int = 10_000) -> bool:
         self.command(CMD_PING, expected=RESP_PING, timeout_ms=timeout_ms)

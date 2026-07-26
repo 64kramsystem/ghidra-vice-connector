@@ -17,12 +17,15 @@ from .protocol import (
     Bank,
     Checkpoint,
     CPU_OP_EXEC,
+    DisplayFrame,
     MEMSPACE_MAIN,
+    PaletteEntry,
     RawEvent,
     Register,
     ViceBmpClient,
     ViceConnectionError,
     ViceFailure,
+    ViceProtocolError,
     ViceTimeoutError,
     ViceValidationError,
 )
@@ -156,6 +159,8 @@ class ViceController:
         self._coordinator: Optional[threading.Thread] = None
         self._events_enabled = False
         self.vice_version: Optional[str] = None
+        # None on a release build, which reports no revision at all.
+        self.vice_revision: Optional[int] = None
         self.banks: Tuple[Bank, ...] = ()
         client.set_event_callback(self._on_raw_event)
         client.set_terminal_callback(self._on_terminal)
@@ -198,7 +203,9 @@ class ViceController:
             self._execution_state = "unknown"
         try:
             self.client.connect(discover_registers=discover_registers)
-            self.vice_version = self.client.vice_info()
+            info = self.client.vice_info()
+            self.vice_version = info.version_string
+            self.vice_revision = info.revision
             self.banks = tuple(self.client.banks_available())
         except BaseException:
             self.client.disconnect()
@@ -713,6 +720,41 @@ class ViceController:
                 if sync_trace else None
             ),
         )
+
+    def capture_display(
+        self, *, use_vic: bool = True, timeout_ms: int = 10_000
+    ) -> Tuple[int, Tuple[DisplayFrame, List[PaletteEntry]]]:
+        """Capture one frame together with the palette that renders it.
+
+        Requires a stopped target, through `_stopped_call`, and refuses
+        `running` or `unknown` before any frame is sent. That is not caution
+        about reading pixels: sending *any* binary-monitor command traps VICE
+        into the monitor, which emits registers and `STOPPED`. A capture
+        advertised as read-only would therefore stop the emulator, hold the
+        operation lock while the coordinator queued that `STOPPED`, and return
+        claiming the execution state was unchanged -- exactly the divergence
+        this controller exists to prevent. A caller wanting a frame mid-run
+        does `interrupt` / `capture_display` / `resume`, where the mutations and
+        their events stay visible.
+
+        Both requests are non-mutating and share one timeout budget. The
+        pairing is not atomic against an external palette change; the window is
+        minimized, not eliminated.
+        """
+        def capture(remaining):
+            frame = self.client.display_get(use_vic, timeout_ms=remaining())
+            palette = self.client.palette_get(use_vic, timeout_ms=remaining())
+            if frame.buffer:
+                highest = max(frame.buffer)
+                if highest >= len(palette):
+                    raise ViceProtocolError(
+                        f"display capture: pixel index {highest} is outside "
+                        f"the {len(palette)}-entry palette, so the frame is "
+                        f"not renderable"
+                    )
+            return frame, palette
+
+        return self._stopped_call(capture, timeout_ms=timeout_ms)
 
     def list_checkpoints(
         self, *, timeout_ms: int = 10_000
