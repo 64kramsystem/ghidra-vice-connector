@@ -623,67 +623,36 @@ def _rollback(
 
 
 def publish(repo_root: Path, plan: PublishPlan, runner: Runner = run) -> str:
-    """Create the GitHub release, or accept one that is already correct.
+    """Create the GitHub release and confirm the assets landed."""
+    runner(
+        [
+            "gh", "release", "create", plan.tag,
+            "--repo", plan.repo,
+            "--verify-tag",
+            "--title", f"{PRODUCT} {plan.version}",
+            # --notes-file, not --notes-from-tag: gh refuses the latter together
+            # with --repo, and --repo must stay because gh otherwise resolves
+            # through the wrong remote here.
+            "--notes-file", str(plan.notes_path),
+            f"--latest={'true' if MARK_LATEST else 'false'}",
+            *[str(path) for path in plan.assets],
+        ],
+        repo_root,
+    )
 
-    Idempotent on purpose: a pushed tag does not prove the release was never
-    created. A run whose `create` succeeded and whose verification then failed
-    leaves exactly that state, and calling `create` again would fail on a release
-    that is already right.
-    """
-    expected = sorted(path.name for path in plan.assets)
-    existing = _existing_release_assets(repo_root, plan, runner)
-
-    if existing is None:
+    listed = sorted(
         runner(
-            [
-                "gh", "release", "create", plan.tag,
-                "--repo", plan.repo,
-                "--verify-tag",
-                "--title", f"{PRODUCT} {plan.version}",
-                # --notes-file, not --notes-from-tag: gh refuses the latter
-                # together with --repo, and --repo must stay.
-                "--notes-file", str(plan.notes_path),
-                f"--latest={'true' if MARK_LATEST else 'false'}",
-                *[str(path) for path in plan.assets],
-            ],
-            repo_root,
-        )
-    elif existing == expected:
-        print(f"{plan.tag} is already published with the expected assets")
-        return plan.version
-    else:
-        raise ReleaseError(
-            f"{plan.tag} already exists on {plan.repo} with assets {existing}, "
-            f"not {expected}; inspect and fix it by hand"
-        )
-
-    listed = _existing_release_assets(repo_root, plan, runner)
-    if listed != expected:
-        raise ReleaseError(
-            f"released assets {listed} do not match expected {expected}"
-        )
-    print(f"published {plan.tag} to {plan.repo}")
-    return plan.version
-
-
-def _existing_release_assets(
-    repo_root: Path, plan: PublishPlan, runner: Runner = run
-) -> list[str] | None:
-    """Asset names of an existing release, or None when there is no release."""
-    try:
-        listed = runner(
             ["gh", "release", "view", plan.tag, "--repo", plan.repo,
              "--json", "assets", "--jq", ".assets[].name"],
             repo_root,
-        )
-    except ReleaseError as error:
-        # Only "not found" means there is no release. Swallowing every failure
-        # would report a transport error or a permissions problem as absence, and
-        # then try to create a release that may already exist.
-        if "not found" in str(error).lower():
-            return None
-        raise
-    return sorted(listed.split())
+        ).split()
+    )
+    expected = sorted(path.name for path in plan.assets)
+    if listed != expected:
+        raise ReleaseError(f"released assets {listed} do not match expected {expected}")
+
+    print(f"published {plan.tag} to {plan.repo}")
+    return plan.version
 
 
 # ---------------------------------------------------------------------------- cli
