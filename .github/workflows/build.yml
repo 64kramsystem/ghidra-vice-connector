@@ -211,8 +211,3 @@ jobs:
         name: gui-smoke-diagnostics
         path: ${{ runner.temp }}/gui-smoke-artifacts/**
         if-no-files-found: ignore
-
-  # Version-matched release on push to master / manual dispatch. Consumes the
-  # Ghidra version resolved by `build` (via job outputs) so a new Ghidra release
-  # landing mid-run cannot mislabel the artifact. gui-smoke is intentionally not
-  # a dependency: it is informational, not a release gate.
