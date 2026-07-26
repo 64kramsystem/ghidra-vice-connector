@@ -495,3 +495,58 @@ def test_release_scratch_files_do_not_dirty_the_repository(repo: Path):
     assert git(repo, "status", "--porcelain").strip() == ""
     assert str(release.MANIFEST_PATH).startswith("dist/")
     assert str(release.CHECKSUMS_PATH).startswith("dist/")
+
+
+def test_publish_refuses_a_missing_manifest(repo: Path):
+    """Regression: this path once raised NameError instead of refusing."""
+    prepared(repo)
+    (repo / release.MANIFEST_PATH).unlink()
+
+    with pytest.raises(release.ReleaseError, match="missing"):
+        release.publish(repo, recording_runner(repo))
+
+
+def test_publish_rejects_a_manifest_listing_a_noncanonical_artifact(repo: Path):
+    """Nonempty is not enough: the names must be the canonical set."""
+    prepared(repo)
+    stray = repo / "dist" / "something-else.zip"
+    stray.write_bytes(b"stray")
+    manifest = json.loads((repo / release.MANIFEST_PATH).read_text(encoding="utf-8"))
+    manifest["artifacts"] = [
+        {"name": stray.name, "path": str(stray), "sha256": release.sha256(stray)}
+    ]
+    (repo / release.MANIFEST_PATH).write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(release.ReleaseError, match="manifest lists"):
+        release.publish(repo, recording_runner(repo))
+
+
+def test_publish_refuses_a_remote_tag_on_a_different_commit(repo: Path):
+    version = prepared(repo)
+    (repo / "extra.txt").write_text("x", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "later work")
+    git(repo, "tag", "-d", f"v{version}")
+    git(repo, "tag", "-a", f"v{version}", "-m", "moved")
+
+    with pytest.raises(release.ReleaseError, match="origin has no"):
+        release.publish(repo, recording_runner(repo))
+
+
+def test_checksums_match_recomputed_artifact_hashes(repo: Path):
+    """Filenames and a line count would pass a file full of zero hashes."""
+    prepared(repo)
+    release.publish(repo, recording_runner(repo))
+
+    manifest = release.read_manifest(repo)
+    expected = {
+        Path(entry["path"]).name: release.sha256(Path(entry["path"]))
+        for entry in manifest["artifacts"]
+    }
+    written = {}
+    for line in (repo / release.CHECKSUMS_PATH).read_text(encoding="utf-8").splitlines():
+        digest, name = line.split("  ", 1)
+        written[name] = digest
+
+    assert written == expected
+    assert all(len(digest) == 64 and set(digest) != {"0"} for digest in written.values())

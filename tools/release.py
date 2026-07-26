@@ -274,7 +274,7 @@ def read_manifest(repo_root: Path) -> dict:
     path = repo_root / MANIFEST_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.is_file():
-        raise ReleaseError(f"{MANIFEST_NAME} is missing; run prepare first")
+        raise ReleaseError(f"{MANIFEST_PATH} is missing; run prepare first")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
