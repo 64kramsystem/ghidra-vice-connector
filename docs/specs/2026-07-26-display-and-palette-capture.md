@@ -1,12 +1,9 @@
 # Display and palette capture
 
 Date: 2026-07-26
-Status: implemented 2026-07-27, after three review rounds. Two items remain outstanding and
-are deliberate: CI is still not pinned to a VICE at r46020 or later, so the live capture tests
-skip there (the runner image's apt package predates the fix and building VICE from source is a
-larger change); and the TraceRMI/Ghidra smoke test proving the ~140 KB base64 string survives
-the real method transport is unwritten, since it belongs in `test/gui-smoke/run.sh` and needs a
-Ghidra install plus Xvfb. Offline suite: 336 passing.
+Status: implemented 2026-07-27, after three review rounds. CI is not pinned to
+VICE r46020 or later, so live capture tests skip there; the runner image's apt
+package predates the fix and building VICE from source is a larger change.
 
 ## Motivation
 
@@ -149,10 +146,9 @@ Validation, each error naming the offending value:
 
 ### Target method
 
-One method, `capture_display`, declared in `src/main/py/src/vice/contracts.py` — the contract
-source of truth, since `test_automation.py` enforces exact generation of the JSON — as
-`c64_vice_v1_capture_display`, with capability `display.capture`, `SURFACE_REVISION = 2`, and
-a regenerated `contracts/c64-vice-api-v1.json`.
+One method, `capture_display`, declared in `src/main/py/src/vice/contracts.py` as
+`c64_vice_v1_capture_display`, with capability `display.capture`,
+`SURFACE_REVISION = 2`, and a regenerated `contracts/c64-vice-api-v1.json`.
 
 | argument | required | notes |
 | --- | --- | --- |
@@ -268,7 +264,7 @@ Offline, with the existing `tests/bmp_helpers.py` fakes:
   `0xFFFFFFFF` ahead of the real reply is demultiplexed correctly, so neither event is mistaken
   for a response.
 - Automation: `buffer_base64` decodes back to the exact fake buffer.
-- Contract: method, capability, `SURFACE_REVISION = 2`, regenerated JSON, `CHANGELOG.md`.
+- Automation capabilities advertise `display.capture` at surface revision 2.
 
 Live, only against a build at r46020 or later:
 

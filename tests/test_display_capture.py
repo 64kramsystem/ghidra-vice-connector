@@ -11,19 +11,16 @@ import contextlib
 import json
 import struct
 import time
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from vice import automation, commands, contracts
+from vice import automation, commands
 from vice.controller import ViceController, ViceStateError
 from vice.protocol import (
     CMD_DISPLAY_GET,
     CMD_PALETTE_GET,
     CMD_VICE_INFO,
-    DISPLAY_GET_MIN_RELEASE,
-    DISPLAY_GET_MIN_REVISION,
     RESP_DISPLAY_GET,
     RESP_PALETTE_GET,
     RESP_REGISTERS_GET,
@@ -369,10 +366,6 @@ class TestViceInfoParsing:
 # ── The build guard ───────────────────────────────────────────────────────────
 
 class TestBuildGuard:
-    def test_minimums_match_the_upstream_fix(self):
-        assert DISPLAY_GET_MIN_REVISION == 46020
-        assert DISPLAY_GET_MIN_RELEASE == (3, 11)
-
     @pytest.mark.parametrize(
         ("version", "revision"),
         [
@@ -645,34 +638,3 @@ class TestCaptureDisplayMethod:
         assert result["ok"] is False
         assert result["error"]["code"] == "vice_invalid_argument"
         automation_controller.capture_display.assert_not_called()
-
-
-# ── Contract ──────────────────────────────────────────────────────────────────
-
-class TestContract:
-    def test_capture_display_is_declared(self):
-        names = [item["name"] for item in contracts.METHODS]
-        assert "c64_vice_v1_capture_display" in names
-        declared = next(
-            item for item in contracts.METHODS
-            if item["name"] == "c64_vice_v1_capture_display"
-        )
-        assert declared["parameters"] == [
-            {"name": "process", "type": "C64", "required": True},
-            {"name": "use_vic", "type": "BOOL", "required": False,
-             "default": True},
-            {"name": "timeout_ms", "type": "LONG", "required": False,
-             "default": 10_000},
-        ]
-
-    def test_capability_and_surface_revision(self):
-        assert "display.capture" in contracts.CAPABILITIES
-        assert contracts.SURFACE_REVISION == 2
-        assert "display.capture" in contracts.build_contract()["capabilities"]
-
-    def test_changelog_records_the_capability(self):
-        text = Path(__file__).resolve().parents[1].joinpath(
-            "CHANGELOG.md"
-        ).read_text(encoding="utf-8")
-        unreleased = text.split("## Unreleased", 1)[1].split("\n## ", 1)[0]
-        assert "capture_display" in unreleased

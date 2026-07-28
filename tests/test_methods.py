@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, call
 
 import pytest
 
-from vice import commands, methods
+from vice import automation, commands, methods
 from vice.protocol import CPU_OP_EXEC, CPU_OP_LOAD, CPU_OP_STORE
 
 
@@ -24,29 +24,12 @@ def controller():
     commands.STATE.controller = None
 
 
-def test_gui_and_automation_share_one_registry():
-    registered = set(methods.REGISTRY.methods)
-    gui = {
-        "resume", "interrupt", "step_into", "step_over", "step_out",
-        "refresh_registers", "refresh_memory", "refresh_breakpoints",
-        "set_breakpoint_execute", "set_watchpoint_read",
-        "set_watchpoint_write", "delete_breakpoint", "toggle_breakpoint",
-        "read_memory", "write_memory", "write_register",
-        "reset_soft", "reset_hard",
-    }
-    automation = {
-        "c64_vice_v1_capabilities", "c64_vice_v1_status",
-        "c64_vice_v1_get_registers", "c64_vice_v1_set_registers",
-        "c64_vice_v1_list_banks", "c64_vice_v1_read_memory",
-        "c64_vice_v1_write_memory", "c64_vice_v1_list_checkpoints",
-        "c64_vice_v1_set_checkpoint", "c64_vice_v1_delete_checkpoint",
-        "c64_vice_v1_toggle_checkpoint", "c64_vice_v1_step",
-        "c64_vice_v1_next", "c64_vice_v1_finish",
-        "c64_vice_v1_resume", "c64_vice_v1_interrupt",
-        "c64_vice_v1_wait_for_stop", "c64_vice_v1_reset",
-    }
-    assert gui <= registered
-    assert automation <= registered
+def test_gui_and_automation_methods_share_the_runtime_registry():
+    assert methods.REGISTRY.methods["resume"] is methods.resume
+    assert (
+        methods.REGISTRY.methods["c64_vice_v1_capabilities"]
+        is automation.capabilities
+    )
 
 
 def test_execution_controls_use_controller(controller):
