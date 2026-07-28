@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+## 0.100.0
 - `tools/release` now accepts an exact `X.Y.Z` release version as well as `major`, `minor`, or `patch`, and no longer runs test suites before building and publishing a release.
 
 - Added display capture: `c64_vice_v1_capture_display` returns one rendered frame as a
