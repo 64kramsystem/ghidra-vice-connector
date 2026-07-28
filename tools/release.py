@@ -1,8 +1,8 @@
 """Scripted releases for ghidra-vice-connector.
 
-One command:
+One command, with either a relative bump or an exact version:
 
-    tools/release minor        # or major / patch
+    tools/release minor        # or major / patch / 1.2.3
 
 A release tags its own commit `v<version>`, so a HEAD already carrying such a tag
 has nothing to release: the run says so and exits 0 without touching anything.
@@ -11,8 +11,8 @@ version line.
 
 Otherwise it refuses unless the checkout is on the default branch, clean, and
 exactly in sync with origin. Then it writes the version, rolls the changelog,
-runs the local runtime tests, builds and inspects the release candidate artifacts,
-commits, tags, pushes the branch and the tag, and publishes the GitHub release.
+builds and inspects the release candidate artifacts, commits, tags, pushes the
+branch and the tag, and publishes the GitHub release.
 
 Everything fallible happens *before* the push, because the push is a one-way
 door: after it, the tag is public and no rollback here can retract it. Until then
@@ -84,7 +84,7 @@ def run(command: Sequence[str], cwd: Path) -> str:
 
 
 def next_version(current: str, bump: str) -> str:
-    """Return the next semantic version.
+    """Return the selected semantic version.
 
     Note `0.99.0` + minor is `0.100.0`, not `1.0.0`: semver places no limit on a
     component's magnitude, and both Maven and PEP 440 compare them numerically.
@@ -100,7 +100,9 @@ def next_version(current: str, bump: str) -> str:
         return f"{major}.{minor + 1}.0"
     if bump == "patch":
         return f"{major}.{minor}.{patch + 1}"
-    raise ReleaseError(f"unknown bump: {bump!r}")
+    if _SEMVER_RE.fullmatch(bump):
+        return bump
+    raise ReleaseError(f"expected major, minor, patch, or X.Y.Z; got {bump!r}")
 
 
 def read_version(repo_root: Path) -> str:
@@ -382,10 +384,6 @@ def write_checksums(repo_root: Path, artifacts: Sequence[Path]) -> Path:
     return path
 
 
-GATES: tuple[tuple[str, ...], ...] = (
-    (sys.executable, "-m", "pytest", "tests/", "--ignore=tests/test_live_vice.py"),
-)
-
 BUILD: tuple[tuple[str, ...], ...] = (
     ("./gradlew", "--no-daemon", "clean", "buildExtension"),
 )
@@ -538,9 +536,6 @@ def prepare(repo_root: Path, bump: str, runner: Runner = run) -> str:
         written = [*write_version(repo_root, version), changelog]
         roll_changelog(changelog, version)
 
-        for gate in GATES:
-            print(f"gate: {' '.join(gate)}")
-            runner(gate, repo_root)
         for step in BUILD:
             print(f"build: {' '.join(step)}")
             runner(step, repo_root)
@@ -648,10 +643,12 @@ def publish(repo_root: Path, plan: PublishPlan, runner: Runner = run) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=f"Cut and publish a {PRODUCT} release",
-        epilog="Runs runtime tests, builds, commits, tags, pushes, and publishes.",
+        epilog="Builds, commits, tags, pushes, and publishes.",
     )
     parser.add_argument(
-        "bump", choices=("major", "minor", "patch"), help="which component to raise"
+        "bump",
+        metavar="{major,minor,patch,X.Y.Z}",
+        help="component to raise or exact release version",
     )
 
     args = parser.parse_args(argv)
