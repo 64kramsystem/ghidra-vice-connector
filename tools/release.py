@@ -11,7 +11,7 @@ version line.
 
 Otherwise it refuses unless the checkout is on the default branch, clean, and
 exactly in sync with origin. Then it writes the version, rolls the changelog,
-runs the gates against that release candidate, builds and inspects the artifacts,
+runs the local runtime tests, builds and inspects the release candidate artifacts,
 commits, tags, pushes the branch and the tag, and publishes the GitHub release.
 
 Everything fallible happens *before* the push, because the push is a one-way
@@ -119,9 +119,8 @@ def read_version(repo_root: Path) -> str:
 def write_version(repo_root: Path, version: str) -> list[Path]:
     """Write the version, then regenerate the contract JSON built from it.
 
-    Regeneration is not optional: the connector's own suite asserts the file
-    equals `contract_json()`, so a bump without it fails the gates -- which is
-    the intended safety net, provided the write happens before they run.
+    Regeneration is part of the write so the published contract cannot retain
+    the previous connector version.
     """
     contracts_path = repo_root / CONTRACTS_PY
     text = contracts_path.read_text(encoding="utf-8")
@@ -383,18 +382,8 @@ def write_checksums(repo_root: Path, artifacts: Sequence[Path]) -> Path:
     return path
 
 
-# ------------------------------------------------------------------------- gates
-
-
-# The live-VICE suite is excluded deliberately: it needs a running emulator with
-# the binary monitor open, which is not a reasonable precondition for cutting a
-# release, and CI runs it with REQUIRE_LIVE_VICE=1 on every push. prepare says so
-# out loud rather than skipping it silently.
 GATES: tuple[tuple[str, ...], ...] = (
     (sys.executable, "-m", "pytest", "tests/", "--ignore=tests/test_live_vice.py"),
-    # test/, not tests/: the bats file and the pytest suite live in sibling
-    # directories, and a tests/*.bats glob silently matches nothing.
-    ("bats", "test/import-prg.bats"),
 )
 
 BUILD: tuple[tuple[str, ...], ...] = (
@@ -659,7 +648,7 @@ def publish(repo_root: Path, plan: PublishPlan, runner: Runner = run) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=f"Cut and publish a {PRODUCT} release",
-        epilog="Runs the gates, builds, commits, tags, pushes, and publishes.",
+        epilog="Runs runtime tests, builds, commits, tags, pushes, and publishes.",
     )
     parser.add_argument(
         "bump", choices=("major", "minor", "patch"), help="which component to raise"

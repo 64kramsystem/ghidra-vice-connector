@@ -38,22 +38,21 @@
   with a timeout that blamed the port rather than the argument. It now passes the
   documented URI form — `ip4://HOST:PORT`, or `ip6://[HOST]:PORT` for an IPv6 literal —
   and only for the bind address; client-side connects stay plain host and port. The same
-  correction applies to `README.md`, the connect-only launcher's description, the GUI
-  smoke harness, and the CI job that starts VICE for the live suite.
+  correction applies to `README.md`, the connect-only launcher's description, and the
+  CI job that starts VICE for the live suite.
 
 - Added `tools/release <major|minor|patch>`, replacing the retired CI release job.
   One command: it refuses unless the checkout is on the default branch, clean and
   exactly in sync with origin, then writes `CONNECTOR_VERSION`, regenerates the
-  published contract from it, rolls the changelog, runs the gates against that
-  candidate, builds the extension, commits, tags, pushes, and creates the GitHub
+  published contract from it, rolls the changelog, runs the local runtime tests,
+  builds the extension, commits, tags, pushes, and creates the GitHub
   release marked latest — these releases being the only way to install without a
   JDK, Gradle and a Ghidra install. Everything that can fail runs before the push;
   a pushed tag cannot be retracted, so re-running the command reports that tag as
   released rather than bumping again. The changelog is rolled before the build because
   `buildExtension.gradle` copies the project root, so a stale one would ship
-  inside the zip — which `prepare` now checks. The live-VICE suite is excluded
-  from the release gates and says so: it needs a running emulator, and CI covers
-  it on every push.
+  inside the zip — which `prepare` now checks. The live-VICE suite needs a running
+  emulator, so it remains in CI rather than the local release path.
 
 - Versioning moves to semantic versions, starting at `0.99.0`. `CONNECTOR_VERSION`
   in `contracts.py` is the source of truth, and the packaged extension now carries

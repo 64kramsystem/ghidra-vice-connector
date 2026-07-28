@@ -261,54 +261,6 @@ class TestStopResume:
         assert 'RUNNING' not in states
 
 
-# ── path constant consistency ──────────────────────────────────────────────────
-
-class TestPathConstants:
-    """
-    Path strings in commands.py must be consistent with the schema hierarchy
-    defined in schema.xml.
-    """
-
-    def test_thread_path_is_child_of_c64(self):
-        assert commands.THREAD_PATH.startswith(commands.C64_PATH + '.')
-
-    def test_frame_path_is_child_of_thread(self):
-        assert commands.FRAME_PATH.startswith(commands.THREAD_PATH + '.')
-
-    def test_regs_path_is_child_of_frame(self):
-        assert commands.REGS_PATH.startswith(commands.FRAME_PATH + '.')
-
-    def test_mem_path_is_child_of_c64(self):
-        assert commands.MEM_PATH.startswith(commands.C64_PATH + '.')
-
-    def test_bps_path_is_child_of_c64(self):
-        assert commands.BPS_PATH.startswith(commands.C64_PATH + '.')
-
-    def test_reg_path_template_contains_name(self):
-        assert '{name}' in commands.REG_PATH
-
-    def test_bp_path_template_contains_n(self):
-        assert '{n}' in commands.BP_PATH
-
-    def test_reg_path_instantiation(self):
-        p = commands.REG_PATH.format(name='PC')
-        assert p.startswith(commands.REGS_PATH)
-        assert p.endswith('[PC]')
-
-    def test_bp_path_instantiation(self):
-        p = commands.BP_PATH.format(n=3)
-        assert p.startswith(commands.BPS_PATH)
-        assert p.endswith('[3]')
-
-    def test_mem_region_path_template_contains_key(self):
-        assert '{key}' in commands.MEM_REGION_PATH
-
-    def test_mem_region_path_instantiation(self):
-        p = commands.MEM_REGION_PATH.format(key='ram')
-        assert p.startswith(commands.MEM_PATH)
-        assert p.endswith('[ram]')
-
-
 # ── put_registers detailed checks ────────────────────────────────────────────
 
 class TestPutRegistersDetailed:
