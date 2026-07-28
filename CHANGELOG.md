@@ -48,8 +48,8 @@
   candidate, builds the extension, commits, tags, pushes, and creates the GitHub
   release marked latest — these releases being the only way to install without a
   JDK, Gradle and a Ghidra install. Everything that can fail runs before the push;
-  if publishing fails afterwards, re-running the command resumes from the pushed
-  tag rather than bumping again. The changelog is rolled before the build because
+  a pushed tag cannot be retracted, so re-running the command reports that tag as
+  released rather than bumping again. The changelog is rolled before the build because
   `buildExtension.gradle` copies the project root, so a stale one would ship
   inside the zip — which `prepare` now checks. The live-VICE suite is excluded
   from the release gates and says so: it needs a running emulator, and CI covers
@@ -91,3 +91,18 @@
   controller.
 - Relicensed the maintained connector to Apache-2.0 with original-project
   attribution in `NOTICE`.
+- `tools/release` now exits successfully when HEAD already carries its release
+  tag, reporting that there is nothing to release rather than failing. A release
+  tags its own commit, so a tagged HEAD is the record that this commit was
+  released — and until now a re-run over one was an error: either
+  `ensure_tag_absent` refused, or `resumable_version` fired first and
+  re-attempted `gh release create` for a release that already existed, which
+  fails. That is what makes `~/code/scripts/release_ghidra_tools`, running this
+  script alongside GhidraMCP-next's and c64-mcp's, re-runnable after any one of
+  them fails: a repository with nothing new is a no-op, not a failure that stops
+  the sweep. Only `v<semver>` tags count, so the old `v12.1-<timestamp>` tag is
+  not mistaken for a release of this version line. The publish-only resume path
+  is removed with it: a publish that fails after the push now leaves a tagged
+  HEAD that reads as released, so finish that case by hand with
+  `gh release create` — no local state distinguishes it from a completed
+  release, and guessing the other way would re-publish.

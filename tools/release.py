@@ -4,19 +4,24 @@ One command:
 
     tools/release minor        # or major / patch
 
-It refuses unless the checkout is on the default branch, clean, and exactly in
-sync with origin. Then it writes the version, rolls the changelog, runs the
-gates against that release candidate, builds and inspects the artifacts, commits,
-tags, pushes the branch and the tag, and publishes the GitHub release.
+A release tags its own commit `v<version>`, so a HEAD already carrying such a tag
+has nothing to release: the run says so and exits 0 without touching anything.
+Only `v<semver>` counts — the old `v12.1-<timestamp>` tag is not a release of this
+version line.
+
+Otherwise it refuses unless the checkout is on the default branch, clean, and
+exactly in sync with origin. Then it writes the version, rolls the changelog,
+runs the gates against that release candidate, builds and inspects the artifacts,
+commits, tags, pushes the branch and the tag, and publishes the GitHub release.
 
 Everything fallible happens *before* the push, because the push is a one-way
 door: after it, the tag is public and no rollback here can retract it. Until then
 a failure restores the working tree, the index and the branch ref, so a failed
 release is a no-op.
 
-If the push succeeds but publishing fails, re-running the same command resumes:
-it sees HEAD already tagged and that tag already on origin, skips straight to
-publishing, and says so.
+A publish that fails after the push leaves a tagged HEAD, which this command now
+reads as released. Finish that one by hand with `gh release create`; re-running
+will not redo it.
 """
 
 from __future__ import annotations
@@ -238,6 +243,21 @@ def ensure_in_sync_with_origin(repo_root: Path, runner: Runner = run) -> str:
     return runner(
         ["git", "rev-parse", f"origin/{DEFAULT_BRANCH}"], repo_root
     ).strip()
+
+
+def head_release_tag(repo_root: Path, runner: Runner = run) -> str | None:
+    """The version already released at HEAD, if any.
+
+    A release tags its own commit, so a tagged HEAD has nothing left to release.
+    Only `v<semver>` counts: the old tag line here uses `v12.1-<timestamp>`,
+    which is not a release of this version line.
+    """
+    for tag in runner(
+        ["git", "tag", "--points-at", "HEAD", "--list", "v*"], repo_root
+    ).split():
+        if _SEMVER_RE.fullmatch(tag[1:]):
+            return tag[1:]
+    return None
 
 
 def ensure_tag_absent(repo_root: Path, tag: str, runner: Runner = run) -> None:
@@ -481,10 +501,10 @@ def release(repo_root: Path, bump: str, runner: Runner = run) -> str:
     ensure_default_branch(repo_root, runner)
     ensure_clean(repo_root, runner)
 
-    resumed = resumable_version(repo_root, runner)
-    if resumed is not None:
-        print(f"v{resumed} is already tagged and pushed; publishing only")
-        return publish(repo_root, build_publish_plan(repo_root, resumed, runner), runner)
+    released = head_release_tag(repo_root, runner)
+    if released is not None:
+        print(f"HEAD is already tagged v{released}; nothing to release")
+        return released
 
     origin_sha = ensure_in_sync_with_origin(repo_root, runner)
     version = prepare(repo_root, bump, runner)
@@ -509,28 +529,6 @@ def release(repo_root: Path, bump: str, runner: Runner = run) -> str:
     )
 
     return publish(repo_root, plan, runner)
-
-
-def resumable_version(repo_root: Path, runner: Runner = run) -> str | None:
-    """Return the version to publish when a previous run pushed but did not publish.
-
-    Only when HEAD carries a release tag that origin already has at the same
-    commit: that is exactly the state a failed publish leaves behind, and it is
-    not recoverable by rolling anything back.
-    """
-    tag = runner(
-        ["git", "tag", "--points-at", "HEAD", "--list", "v*"], repo_root
-    ).split()
-    if len(tag) != 1:
-        return None
-    version = tag[0][1:]
-    if _SEMVER_RE.fullmatch(version) is None:
-        return None
-    commit = head_sha(repo_root, runner)
-    peeled = runner(
-        ["git", "ls-remote", "origin", f"refs/tags/{tag[0]}^{{}}"], repo_root
-    ).split()
-    return version if peeled and peeled[0] == commit else None
 
 
 def prepare(repo_root: Path, bump: str, runner: Runner = run) -> str:
