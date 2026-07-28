@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- `tools/release` now refuses when HEAD is already tagged `v<version>`, instead of reporting nothing to release and exiting 0.
 
 ## 0.100.0
 - `tools/release` now accepts an exact `X.Y.Z` release version as well as `major`, `minor`, or `patch`, and no longer runs test suites before building and publishing a release.

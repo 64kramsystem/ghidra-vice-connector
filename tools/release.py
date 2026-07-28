@@ -5,7 +5,7 @@ One command, with either a relative bump or an exact version:
     tools/release minor        # or major / patch / 1.2.3
 
 A release tags its own commit `v<version>`, so a HEAD already carrying such a tag
-has nothing to release: the run says so and exits 0 without touching anything.
+has nothing to release: the run refuses without touching anything.
 Only `v<semver>` counts — the old `v12.1-<timestamp>` tag is not a release of this
 version line.
 
@@ -21,7 +21,7 @@ release is a no-op.
 
 A publish that fails after the push leaves a tagged HEAD, which this command now
 reads as released. Finish that one by hand with `gh release create`; re-running
-will not redo it.
+refuses rather than redoing it.
 """
 
 from __future__ import annotations
@@ -490,8 +490,7 @@ def release(repo_root: Path, bump: str, runner: Runner = run) -> str:
 
     released = head_release_tag(repo_root, runner)
     if released is not None:
-        print(f"HEAD is already tagged v{released}; nothing to release")
-        return released
+        raise ReleaseError(f"HEAD is already tagged v{released}; nothing to release")
 
     origin_sha = ensure_in_sync_with_origin(repo_root, runner)
     version = prepare(repo_root, bump, runner)
