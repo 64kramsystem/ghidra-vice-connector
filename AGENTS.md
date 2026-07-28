@@ -33,9 +33,35 @@ not reserved for them.
 
 This is a standing instruction from the maintainer, not an oversight to correct.
 
-## Releasing
+## Testing and releasing
 
-- **Do not retain unit tests for release tooling.** The completed repository must
+Tests must execute production code and verify observable behavior.
+
+### Repository policy and declarative content
+
+Do not add repository-policy or declarative-content tests. Do not test repository
+layout, filenames, paths, file or class existence, directory structure, source text,
+documentation, agent instructions, wording, branding, line counts, exact inventories,
+symlinks, or the presence or absence of retired components.
+
+Do not test static declarations merely by reading or matching their contents. This
+includes Markdown, JSON, YAML, TOML, XML, manifests, POM metadata, workflow files,
+environment templates, dependency declarations, catalogs, schemas, allowlists,
+configuration files, and generated snapshots. Do not assert strings, regular
+expressions, counts, ordering, keys, or duplicated values across such files.
+
+Declarative input may be used only to test the production code that consumes it.
+Exercise the real parser, loader, build, deployment, or runtime behavior with temporary
+fixtures, and assert the resulting behavior rather than the declaration's text or
+repository location.
+
+When a repository-policy test obstructs a legitimate change, delete the test. Do not
+alter documentation, instructions, source layout, configuration, or metadata merely to
+satisfy it.
+
+### Release tooling
+
+- **Do not retain automated tests for release tooling.** The completed repository must
   contain no unit tests, fixtures, mutation checks, or CI assertions targeting it.
 - **Test release-tooling changes before release.** Use temporary tests and controlled,
   non-publishing runs to exercise the affected paths, then remove all temporary test
