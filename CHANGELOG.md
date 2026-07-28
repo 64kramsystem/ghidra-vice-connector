@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `tools/release` now accepts an exact `X.Y.Z` release version as well as `major`, `minor`, or `patch`, and no longer runs test suites before building and publishing a release.
+
 - Added display capture: `c64_vice_v1_capture_display` returns one rendered frame as a
   base64 indexed buffer (row-major, one byte per pixel, each byte an index into the
   returned palette by array position) together with the debug geometry, the inner
