@@ -35,7 +35,7 @@ def test_connect_vice_does_not_start_second_socket(mock_server):
     assert first.ping()
 
 
-def test_start_trace_creates_and_saves_trace():
+def test_start_trace_creates_a_live_trace():
     fake_socket = MagicMock()
     fake_client = MagicMock()
     fake_trace = MagicMock()
@@ -46,4 +46,3 @@ def test_start_trace_creates_and_saves_trace():
         commands.start_trace("127.0.0.1", 1234, MagicMock())
     fake_socket.connect.assert_called_once_with(("127.0.0.1", 1234))
     fake_client.create_trace.assert_called_once()
-    fake_trace.save.assert_called_once()

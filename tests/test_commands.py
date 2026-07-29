@@ -234,10 +234,6 @@ class TestStopResume:
         states = [c.args[1] for c in state_calls]
         assert 'STOPPED' in states
 
-    def test_on_stop_saves_trace(self):
-        commands.on_stop()
-        commands.STATE.trace.save.assert_called()
-
     def test_on_resume_sets_state_running(self):
         commands.on_resume()
         obj = commands.STATE.trace.create_object.return_value
@@ -245,12 +241,6 @@ class TestStopResume:
                        if c.args[0] == '_state']
         states = [c.args[1] for c in state_calls]
         assert 'RUNNING' in states
-
-    def test_on_resume_does_not_save_trace(self):
-        """on_resume() only updates state — it does not save the trace.
-        (RUNNING is transient; save happens on the next STOPPED event.)"""
-        commands.on_resume()
-        commands.STATE.trace.save.assert_not_called()
 
     def test_on_stop_does_not_set_running(self):
         commands.on_stop()
@@ -419,7 +409,6 @@ def test_snapshot_load_sync_refreshes_entire_machine_state():
     assert address.space == "RAM"
     assert address.offset == 0
     assert memory == b"\x00" * 0x10000
-    commands.STATE.trace.save.assert_called_once_with()
     disassembly_address = (
         commands.STATE.trace.disassemble.call_args.args[0]
     )
