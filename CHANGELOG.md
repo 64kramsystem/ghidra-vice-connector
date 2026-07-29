@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+## 0.101.0
 ### Added
 
 - Added deterministic keyboard feed, public joystick ports 1/2, and VICE snapshot save/load to the shared controller and TraceRMI automation surface.
