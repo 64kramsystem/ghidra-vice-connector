@@ -32,6 +32,7 @@ from .util import (
 from .controller import ViceController
 
 log = logging.getLogger('vice-agent')
+TRACE_MEMORY_CHUNK_BYTES = 16_384
 
 
 def _default_remaining_ms():
@@ -212,6 +213,13 @@ def _end_batch_checked(client, where):
         )
 
 
+def _put_trace_memory_bytes(trace, start: int, data: bytes):
+    """Write memory without exceeding TraceRMI's 64 KiB message limit."""
+    for offset in range(0, len(data), TRACE_MEMORY_CHUNK_BYTES):
+        chunk = data[offset:offset + TRACE_MEMORY_CHUNK_BYTES]
+        trace.put_bytes(Address("RAM", start + offset), chunk)
+
+
 def _populate_initial_trace(
     trace, controller, regs, checkpoints, start, end, data, pc
 ):
@@ -235,7 +243,7 @@ def _populate_initial_trace(
                 f"populate_initial_state(): memory "
                 f"0x{start:04X}-0x{end:04X} ({end-start+1} bytes)"
             )
-            trace.put_bytes(Address('RAM', start), data)
+            _put_trace_memory_bytes(trace, start, data)
             log.debug("populate_initial_state(): put_event_thread")
             put_event_thread()
     finally:
@@ -417,9 +425,8 @@ def put_memory_bytes(start: int, length: int = 256):
     vice = STATE.require_vice()
     end = min(start + length - 1, arch.RAM_END)
     data = vice.memory_get(start, end)
-    addr = Address('RAM', start)
     with open_tracked_tx(f'Memory 0x{start:04X}-0x{end:04X}'):
-        STATE.trace.put_bytes(addr, data)
+        _put_trace_memory_bytes(STATE.trace, start, data)
 
 
 # ── Breakpoint population ─────────────────────────────────────────────────────
@@ -501,7 +508,7 @@ def on_stop(remaining_ms=_default_remaining_ms):
                 put_breakpoints_from(checkpoints)
                 # Read memory around PC for listing context
                 log.debug(f"on_stop(): memory 0x{start:04X}-0x{end:04X}")
-                trace.put_bytes(Address('RAM', start), data)
+                _put_trace_memory_bytes(trace, start, data)
                 put_event_thread()
         finally:
             log.debug("on_stop(): end_batch")
@@ -594,7 +601,9 @@ def sync_result(kind: str, result, remaining_ms):
                     set_process_state_inner("STOPPED")
                     put_registers(registers)
                     put_breakpoints_from(checkpoints)
-                    trace.put_bytes(Address("RAM", arch.RAM_START), memory)
+                    _put_trace_memory_bytes(
+                        trace, arch.RAM_START, memory
+                    )
                     put_event_thread()
                 elif kind == "banks":
                     put_environment(prepared)
@@ -607,7 +616,7 @@ def sync_result(kind: str, result, remaining_ms):
                     _prefix, start_text, memspace_text, bank_text = kind.split(":")
                     start = int(start_text)
                     if prepared:
-                        trace.put_bytes(Address("RAM", start), prepared)
+                        _put_trace_memory_bytes(trace, start, prepared)
                 else:
                     raise ValueError(f"Unsupported trace sync kind: {kind}")
         finally:

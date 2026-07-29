@@ -405,10 +405,13 @@ def test_snapshot_load_sync_refreshes_entire_machine_state():
     commands.STATE.trace.snapshot.assert_called_once_with(
         "VICE snapshot loaded"
     )
-    address, memory = commands.STATE.trace.put_bytes.call_args.args
-    assert address.space == "RAM"
-    assert address.offset == 0
-    assert memory == b"\x00" * 0x10000
+    calls = commands.STATE.trace.put_bytes.call_args_list
+    assert len(calls) == 4
+    assert [
+        call.args[0].offset for call in calls
+    ] == [0x0000, 0x4000, 0x8000, 0xC000]
+    assert all(call.args[0].space == "RAM" for call in calls)
+    assert b"".join(call.args[1] for call in calls) == b"\x00" * 0x10000
     disassembly_address = (
         commands.STATE.trace.disassemble.call_args.args[0]
     )
