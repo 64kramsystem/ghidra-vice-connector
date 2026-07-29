@@ -1,31 +1,29 @@
 # Ghidra VICE Connector
 
-A Ghidra debugger extension that connects to the [VICE](https://vice-emu.sourceforge.io/) Commodore 64 emulator via its Binary Monitor Protocol. It uses Ghidra's TraceRmi framework (Ghidra 12.1) to provide live debugging of 6502/6510 code running in VICE.
+A Ghidra 12.1 debugger extension for the Commodore 64. It connects one Ghidra TraceRMI session to one VICE binary-monitor socket and exposes the same controller to Ghidra's debugger UI and MCP automation.
 
-## Features
+## What it supports
 
-- Step into, step over, step out (until RTS/RTI), resume, and interrupt
-- Register display and tracking (PC, A, X, Y, S, P)
-- Live memory view of the full 64 KB address space
-- Breakpoints (execute) and watchpoints (read/write)
-- Automatic disassembly around the program counter on stop events
-- Soft and hard reset
-- A versioned `c64.vice/1.0` TraceRMI automation API for MCP and other clients
-- Bank-aware memory, dynamic register metadata, and checkpoint automation
+- registers, banks, and the full 64 KiB address space;
+- step, next, finish, resume, interrupt, and reset;
+- execute breakpoints and read/write watchpoints;
+- deterministic keyboard and joystick input;
+- VICE snapshots;
+- a bounded composited-display capture;
+- a small `c64.vice/1` TraceRMI method surface used by `c64-mcp`.
 
-The Ghidra UI and automation API share one serialized controller and one VICE
-binary-monitor socket. Automation never opens a second emulator connection.
+The controller serializes monitor commands and publishes VICE stop/resume events to the trace. Memory and display transfers use 16 KiB chunks so no single TraceRMI value carries a full frame or memory image.
 
-## Prerequisites
+## Requirements
 
-- **Ghidra** 12.1 (uses the TraceRmi framework)
-- **JDK 21** — required to *build* the extension. Ghidra 12.1 targets Java 21; the Gradle build fails under newer JDKs (e.g. JDK 26 errors with `Unsupported class file major version 70`).
-- **VICE** with Binary Monitor Protocol enabled
-- **Python 3** with the `ghidratrace` package installed (from Ghidra's `Debugger-rmi-trace` module or via pip)
+- Ghidra 12.1
+- JDK 21 for building
+- Python 3 with Ghidra's `ghidratrace` package
+- VICE with the binary monitor enabled
 
-## Building
+Display capture needs a VICE build containing the safe display-command fix (revision r46020 or later, or release 3.11 or later).
 
-Set `GHIDRA_INSTALL_DIR` to your Ghidra 12.1 installation and build with Gradle, using JDK 21:
+## Build and install
 
 ```sh
 JAVA_HOME=/path/to/jdk-21 \
@@ -33,93 +31,37 @@ GHIDRA_INSTALL_DIR=/path/to/ghidra_12.1_PUBLIC \
 ./gradlew buildExtension
 ```
 
-The extension zip will be in `dist/`.
+Install the zip from `dist/` through Ghidra's **File > Install Extensions**, then restart Ghidra.
 
-## Installation
+## Use
 
-Install the built extension zip through **File > Install Extensions** in Ghidra, then restart.
-
-## Usage
-
-1. Start VICE with the binary monitor enabled:
-
-   ```sh
-   x64sc -binarymonitor -binarymonitoraddress ip4://127.0.0.1:6502
-   ```
-
-2. In Ghidra, open the **Debugger** tool.
-
-3. From the debugger launch menu, select **VICE C64 Debugger**.
-
-4. Configure the host and port (default: `127.0.0.1:6502`) and click **Launch**.
-
-The connector will attach to VICE, read the current CPU state, and populate the trace. You can then use Ghidra's standard debugger controls (step, resume, breakpoints, memory view, etc.).
-
-## Security
-
-The VICE binary monitor is an unauthenticated TCP control channel over the emulator (memory, registers, execution). Keep it bound to `127.0.0.1`; for remote debugging, reach it through SSH port forwarding rather than binding it to a network interface.
-
-## Project Structure
-
-```
-src/main/java/       Stub Java class (required by the Ghidra extension build)
-src/main/py/src/vice/ Python TraceRmi agent
-  arch.py            Architecture constants (6502 language, registers, memory map)
-  commands.py        Trace population — reads state from VICE, writes to Ghidra trace
-  controller.py      Serialized operations and ordered execution-event history
-  protocol.py        Strict VICE Binary Monitor Protocol client
-  automation.py      Versioned C64 automation remote methods
-  contracts.py       Declarative automation capability/method contract
-  methods.py         Ghidra UI remote methods sharing the same controller
-data/
-  debugger-launchers/  Shell launcher and TraceRmi schema
-  support/             Python entry point (vice-c64.py)
-```
-
-## Detailed setup/execution
+Either start VICE yourself:
 
 ```sh
-GHIDRA_PATH=/path/to/ghidra_X.Y.Z_PUBLIC
-GHIDRA_VER=$(basename $GHIDRA_PATH)
-
-# Once: install the ghidratrace library
-
-pip install $GHIDRA_PATH/Ghidra/Debug/Debugger-rmi-trace/pypkg/
-
-# Build and (re)install
-
-./gradlew buildExtension
-rm -rf $HOME/.config/ghidra/$GHIDRA_VER/Extensions/ghidra-vice-connector
-unzip -q dist/$GHIDRA_VER_*_ghidra-vice-connector.zip -d $HOME/.config/ghidra/$GHIDRA_VER/Extensions/
-
-# Once: prepare test program and Ghidra project
-# (imports at the load address from the PRG header — no manual stripping/rebasing)
-
-GHIDRA_HOME=$GHIDRA_PATH data/support/import-prg.sh data/test.prg data/ghidra-project ViceTest
-
-# Prepare and open the project
-#
-# Manual: Right-click test_raw.bin and choose "Open With → Debugger"
-
-x64 -binarymonitor -binarymonitoraddress ip4://127.0.0.1:6502 data/test.prg &
-$GHIDRA_PATH/ghidraRun $PWD/data/ghidra-project/ViceTest.gpr
-
-# Attach debugger: Debugger → Configure and Launch… → VICE…
+x64sc -binarymonitor \
+  -binarymonitoraddress ip4://127.0.0.1:6502
 ```
+
+and choose **VICE C64 Debugger**, or choose **VICE C64 Debugger (launch VICE)** and set the executable path in the launcher. Open Ghidra's Debugger tool before launching.
+
+The monitor must remain on loopback. It is an unauthenticated control channel that can read memory and change emulator state.
+
+Binary-monitor commands stop a running emulator. Automation therefore makes execution transitions explicit: interrupt before reads that require a stable target, then resume afterward. Captured display bytes may be read and discarded after execution resumes because they are already buffered locally.
 
 ## Development
 
-Run the Python agent test suite (the live-VICE tests auto-skip when no emulator is reachable):
-
 ```sh
-pip install pytest
 pytest
 ```
 
-CI (`.github/workflows/build.yml`) resolves the latest Ghidra **12.1** release,
-builds the extension with JDK 21, runs the runtime test suite, and publishes the
-extension artifact.
+Tests that require a live disposable VICE instance skip when it is absent.
 
-## License
+The implementation is under `src/main/py/src/vice/`:
 
-Apache-2.0. `NOTICE` records the original project and authorized relicensing.
+- `protocol.py` implements the strict binary-monitor framing and commands.
+- `controller.py` owns serialized state and event coordination.
+- `commands.py` synchronizes VICE state into the Ghidra trace.
+- `methods.py` exposes debugger UI actions.
+- `automation.py` exposes the MCP-facing TraceRMI methods.
+
+Apache-2.0. `NOTICE` records the original project and relicensing.

@@ -94,7 +94,7 @@ class TestPopulateInitialState:
         paths = [c.args[0] for c in commands.STATE.trace.proxy_object_path.call_args_list]
         assert commands.FRAME_PATH in paths
 
-    def test_does_not_save_during_initial_population(self):
+    def test_does_not_automatically_save_trace(self):
         commands.populate_initial_state()
         commands.STATE.trace.save.assert_not_called()
 

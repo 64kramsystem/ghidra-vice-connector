@@ -3,7 +3,9 @@
 ghidratrace's Batch._get_result catches BaseException and *returns* the exception object rather
 than raising, so end_batch() hands back a list that may contain exceptions. Every call site here
 discarded that list, which meant a failed queued operation -- an endTx among them -- left no
-trace in this process and made the next trace operation fail without exposing the original cause.
+trace in this process. The next statement was trace.save(); with the transaction still open
+Ghidra answered "Can't save during transaction" and killed the agent, pointing at save() rather
+than at whatever actually failed.
 """
 
 from unittest.mock import MagicMock

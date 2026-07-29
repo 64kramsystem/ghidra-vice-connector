@@ -8,8 +8,8 @@ byte stream cannot be safely re-synchronized.
 
 from __future__ import annotations
 
-import collections
 import logging
+import math
 import queue
 import select
 import socket
@@ -32,9 +32,8 @@ MAX_RESPONSE_BODY = 16 * 1024 * 1024
 MAX_LIST_ITEMS = 4096
 MAX_MEMORY_FRAME = 0xFFFF
 MAX_ABANDONED_REQUESTS = 4096
-# Once a response header declares a body, the single reader cannot recover its
-# framing until every byte arrives. Bound idle time between body fragments so
-# a truncated response cannot leave the session falsely connected forever.
+# Once a response header declares a body, the reader must receive every byte
+# before it can recover framing.
 RESPONSE_BODY_IDLE_TIMEOUT_SECONDS = 5.0
 
 CMD_MEMORY_GET = 0x01
@@ -48,7 +47,6 @@ CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
 CMD_SNAPSHOT_DUMP = 0x41
 CMD_SNAPSHOT_UNDUMP = 0x42
-CMD_RESOURCE_GET = 0x51
 CMD_RESOURCE_SET = 0x52
 CMD_ADVANCE_INSTRUCTIONS = 0x71
 CMD_KEYBOARD_FEED = 0x72
@@ -73,7 +71,6 @@ RESP_CHECKPOINT_TOGGLE = 0x15
 RESP_REGISTERS_GET = 0x31
 RESP_SNAPSHOT_DUMP = 0x41
 RESP_SNAPSHOT_UNDUMP = 0x42
-RESP_RESOURCE_GET = 0x51
 RESP_RESOURCE_SET = 0x52
 RESP_STOPPED = 0x62
 RESP_RESUMED = 0x63
@@ -303,22 +300,9 @@ class RawEvent:
     kind: str
     response_type: int
     pc: Optional[int]
-    # `checkpoint` stays singular for existing consumers and holds the first
-    # match; `checkpoints` carries every checkpoint VICE reported for this stop.
-    # Appended last with a default so existing positional construction keeps
-    # working.
-    checkpoint: Optional[Checkpoint]
     body: bytes
     received_at: float
     checkpoints: Tuple[Checkpoint, ...] = ()
-
-
-@dataclass(frozen=True)
-class DiagnosticEvent:
-    response_type: int
-    error: int
-    body_length: int
-    received_at: float
 
 
 @dataclass(frozen=True)
@@ -581,6 +565,28 @@ def _validate_bool(value: bool, field: str) -> bool:
     return value
 
 
+def _operation_deadline(timeout_ms: int) -> float:
+    if (
+        isinstance(timeout_ms, bool)
+        or not isinstance(timeout_ms, int)
+        or not 1 <= timeout_ms <= 55_000
+    ):
+        raise ViceValidationError("timeout_ms must be in 1..55000")
+    return time.monotonic() + timeout_ms / 1000.0
+
+
+def _remaining_timeout_ms(
+    deadline: float, *, state_may_have_changed: bool = False
+) -> int:
+    remaining = math.ceil((deadline - time.monotonic()) * 1000)
+    if remaining <= 0:
+        raise ViceTimeoutError(
+            "VICE memory operation exhausted its timeout",
+            state_may_have_changed=state_may_have_changed,
+        )
+    return remaining
+
+
 def _length_prefixed_text(value: str, field: str) -> bytes:
     if not isinstance(value, str):
         raise ViceValidationError(f"{field} must be a string")
@@ -606,13 +612,10 @@ class ViceBmpClient:
         port: int = 6502,
         *,
         max_response_body: int = MAX_RESPONSE_BODY,
-        diagnostic_limit: int = 128,
         max_abandoned_requests: int = MAX_ABANDONED_REQUESTS,
     ):
         if max_response_body < 0:
             raise ValueError("max_response_body must be non-negative")
-        if diagnostic_limit < 1:
-            raise ValueError("diagnostic_limit must be positive")
         if max_abandoned_requests < 1:
             raise ValueError("max_abandoned_requests must be positive")
         self.host = host
@@ -632,7 +635,6 @@ class ViceBmpClient:
         self._terminal_callback: Optional[Callable[[ViceConnectionError], None]] = None
         self._raw_sequence = 0
         self._pending_checkpoints: List[Checkpoint] = []
-        self._diagnostics = collections.deque(maxlen=diagnostic_limit)
         # Build information for the 0x84 guard. Absent until VICE_INFO has been
         # read on *this* connection, and absent means refuse.
         self._vice_info: Optional[ViceInfo] = None
@@ -649,11 +651,6 @@ class ViceBmpClient:
     def terminal_error(self) -> Optional[ViceConnectionError]:
         with self._state_lock:
             return self._terminal_error
-
-    @property
-    def diagnostics(self) -> Tuple[DiagnosticEvent, ...]:
-        with self._state_lock:
-            return tuple(self._diagnostics)
 
     @property
     def vice_build_info(self) -> Optional[ViceInfo]:
@@ -860,7 +857,8 @@ class ViceBmpClient:
                         body_length,
                         body_idle_timeout=RESPONSE_BODY_IDLE_TIMEOUT_SECONDS,
                     )
-                    if body_length else b""
+                    if body_length
+                    else b""
                 )
                 frame = Frame(response_type, error, request_id, body)
                 if request_id == EVENT_REQUEST_ID:
@@ -948,17 +946,20 @@ class ViceBmpClient:
             if checkpoint.stop_on_hit:
                 self._pending_checkpoints.append(checkpoint)
             else:
-                self._emit_event("checkpoint_hit", frame.response_type,
-                                 None, checkpoint, (checkpoint,), frame.body)
+                self._emit_event(
+                    "checkpoint_hit",
+                    frame.response_type,
+                    None,
+                    (checkpoint,),
+                    frame.body,
+                )
             return
         if frame.response_type not in (RESP_STOPPED, RESP_RESUMED):
-            with self._state_lock:
-                self._diagnostics.append(
-                    DiagnosticEvent(
-                        frame.response_type, frame.error, len(frame.body),
-                        time.monotonic(),
-                    )
-                )
+            log.debug(
+                "ignoring unsolicited VICE response 0x%02x (%d bytes)",
+                frame.response_type,
+                len(frame.body),
+            )
             return
         if len(frame.body) not in (0, 2):
             raise ViceProtocolError(
@@ -978,7 +979,6 @@ class ViceBmpClient:
             "stopped" if frame.response_type == RESP_STOPPED else "resumed",
             frame.response_type,
             pc,
-            checkpoints[0] if checkpoints else None,
             checkpoints,
             frame.body,
         )
@@ -988,7 +988,6 @@ class ViceBmpClient:
         kind: str,
         response_type: int,
         pc: Optional[int],
-        checkpoint: Optional[Checkpoint],
         checkpoints: Tuple[Checkpoint, ...],
         body: bytes,
     ) -> None:
@@ -999,7 +998,6 @@ class ViceBmpClient:
                 kind,
                 response_type,
                 pc,
-                checkpoint,
                 body,
                 time.monotonic(),
                 checkpoints,
@@ -1265,11 +1263,9 @@ class ViceBmpClient:
         _validate_id(memspace, "memspace", 0xFF)
         _validate_id(bank_id, "bank_id")
         _validate_bool(side_effects, "side_effects")
-        if not 1 <= timeout_ms <= 55_000:
-            raise ViceValidationError("timeout_ms must be in 1..55000")
+        deadline = _operation_deadline(timeout_ms)
         result = bytearray()
         cursor = start
-        deadline = time.monotonic() + timeout_ms / 1000.0
         while cursor <= end:
             chunk_end = min(end, cursor + MAX_MEMORY_FRAME - 1)
             payload = struct.pack(
@@ -1280,18 +1276,13 @@ class ViceBmpClient:
                 memspace,
                 bank_id,
             )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ViceTimeoutError(
-                    "VICE memory read exhausted its shared timeout",
-                    state_may_have_changed=bool(side_effects),
-                )
-            remaining_ms = max(1, int(remaining * 1000))
             frame = self.command(
                 CMD_MEMORY_GET,
                 payload,
                 expected=RESP_MEMORY_GET,
-                timeout_ms=remaining_ms,
+                timeout_ms=_remaining_timeout_ms(
+                    deadline, state_may_have_changed=bool(side_effects)
+                ),
                 mutating=bool(side_effects),
             )
             body = Cursor(frame.body, "memory get")
@@ -1325,11 +1316,9 @@ class ViceBmpClient:
         _validate_id(memspace, "memspace", 0xFF)
         _validate_id(bank_id, "bank_id")
         _validate_bool(side_effects, "side_effects")
-        if not 1 <= timeout_ms <= 55_000:
-            raise ViceValidationError("timeout_ms must be in 1..55000")
+        deadline = _operation_deadline(timeout_ms)
         completed = []
         offset = 0
-        deadline = time.monotonic() + timeout_ms / 1000.0
         while offset < len(data):
             chunk = data[offset:offset + MAX_MEMORY_FRAME]
             chunk_start = start + offset
@@ -1343,17 +1332,13 @@ class ViceBmpClient:
                 bank_id,
             ) + chunk
             try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise ViceTimeoutError(
-                        "VICE memory write exhausted its shared timeout",
-                        state_may_have_changed=True,
-                    )
                 self.command(
                     CMD_MEMORY_SET,
                     payload,
                     expected=RESP_MEMORY_SET,
-                    timeout_ms=max(1, int(remaining * 1000)),
+                    timeout_ms=_remaining_timeout_ms(
+                        deadline, state_may_have_changed=True
+                    ),
                     mutating=True,
                 )
             except ViceFailure as exc:
@@ -1599,9 +1584,7 @@ class ViceBmpClient:
     def keyboard_feed(
         self, data: bytes, *, timeout_ms: int = 10_000
     ) -> None:
-        if not isinstance(data, bytes):
-            raise ViceValidationError("keyboard data must be bytes")
-        if not 1 <= len(data) <= 0xFF:
+        if not isinstance(data, bytes) or not 1 <= len(data) <= 0xFF:
             raise ViceValidationError(
                 "keyboard data must contain between 1 and 255 bytes"
             )
@@ -1615,29 +1598,20 @@ class ViceBmpClient:
             mutating=True,
         )
 
-    def resource_get_int(
-        self, name: str, *, timeout_ms: int = 10_000
-    ) -> int:
-        frame = self.command(
-            CMD_RESOURCE_GET,
-            _length_prefixed_text(name, "resource name"),
-            expected=RESP_RESOURCE_GET,
+    def joyport_set(
+        self, port: int, value: int, *, timeout_ms: int = 10_000
+    ) -> None:
+        if isinstance(port, bool) or port not in (1, 2):
+            raise ViceValidationError("joyport must be 1 or 2")
+        _validate_id(value, "joyport value", 0xFF)
+        self.command(
+            CMD_JOYPORT_SET,
+            # Printed C64 ports are 1/2; VICE's binary-monitor enum is 0/1.
+            struct.pack("<HH", port - 1, value),
+            expected=RESP_JOYPORT_SET,
             timeout_ms=timeout_ms,
+            mutating=True,
         )
-        cur = Cursor(frame.body, f"resource get {name!r}")
-        resource_type = cur.u8()
-        length = cur.u8()
-        value = cur.take(length)
-        cur.finish()
-        if resource_type != 1:
-            raise ViceProtocolError(
-                f"resource {name!r} has type {resource_type}, expected integer"
-            )
-        if length not in (1, 2, 4):
-            raise ViceProtocolError(
-                f"resource {name!r} has unsupported {length}-byte integer"
-            )
-        return int.from_bytes(value, "little", signed=True)
 
     def resource_set_int(
         self, name: str, value: int, *, timeout_ms: int = 10_000
@@ -1660,22 +1634,6 @@ class ViceBmpClient:
             CMD_RESOURCE_SET,
             payload,
             expected=RESP_RESOURCE_SET,
-            timeout_ms=timeout_ms,
-            mutating=True,
-        )
-
-    def joyport_set(
-        self, port: int, value: int, *, timeout_ms: int = 10_000
-    ) -> None:
-        if port not in (1, 2) or isinstance(port, bool):
-            raise ViceValidationError("joyport must be 1 or 2")
-        _validate_id(value, "joyport value", 0xFF)
-        # The public API uses the control-port numbers printed on a C64.
-        # VICE's binary monitor uses the zero-based JOYPORT_1/JOYPORT_2 enum.
-        self.command(
-            CMD_JOYPORT_SET,
-            struct.pack("<HH", port - 1, value),
-            expected=RESP_JOYPORT_SET,
             timeout_ms=timeout_ms,
             mutating=True,
         )
