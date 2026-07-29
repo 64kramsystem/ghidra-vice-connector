@@ -8,8 +8,8 @@ from typing import Any, Dict, List
 
 API = "c64.vice/1"
 API_MAJOR = 1
-API_MINOR = 0
-SURFACE_REVISION = 2
+API_MINOR = 1
+SURFACE_REVISION = 3
 METHOD_NAMESPACE = "c64_vice_v1_"
 CONNECTOR_NAME = "ghidra-vice-connector"
 CONNECTOR_VERSION = "0.100.0"
@@ -31,8 +31,14 @@ CAPABILITIES = (
     "execution.resume",
     "execution.interrupt",
     "execution.wait_for_stop",
+    "events.list",
+    "input.keyboard.feed",
+    "input.joyport.set",
+    "snapshot.save",
+    "snapshot.load",
+    "state.capture",
     "machine.reset",
-    "display.capture",
+    "display.capture.chunked",
     "trace.sync",
 )
 
@@ -132,11 +138,59 @@ METHODS: List[Dict[str, Any]] = [
         required("after_sequence", "LONG"),
         required("timeout_ms", "LONG"),
     ),
+    method(
+        "list_events",
+        required("after_sequence", "LONG"),
+        optional("limit", "LONG", 128),
+    ),
+    method(
+        "feed_keyboard",
+        required("data", "BYTE_ARR"),
+        TIMEOUT,
+    ),
+    method(
+        "set_joyport",
+        required("port", "LONG"),
+        required("value", "LONG"),
+        TIMEOUT,
+    ),
+    method(
+        "save_snapshot",
+        required("filename", "STRING"),
+        optional("save_roms", "BOOL", False),
+        optional("save_disks", "BOOL", True),
+        TIMEOUT,
+    ),
+    method(
+        "load_snapshot",
+        required("filename", "STRING"),
+        TIMEOUT,
+    ),
+    method(
+        "capture_state",
+        required("expected_event_sequence", "LONG"),
+        required("expected_command_sequence", "LONG"),
+        required("ranges", "LONG_ARR"),
+        required("names", "STRING_ARR"),
+        required("register_names", "STRING_ARR"),
+        optional("include_checkpoints", "BOOL", True),
+        TIMEOUT,
+    ),
     method("reset", optional("kind", "STRING", "soft"), TIMEOUT),
     method(
         "capture_display",
         optional("use_vic", "BOOL", True),
         TIMEOUT,
+    ),
+    method(
+        "read_display_capture",
+        required("capture_id", "STRING"),
+        required("offset", "LONG"),
+        optional("max_bytes", "LONG", 16_384),
+    ),
+    method(
+        "discard_display_capture",
+        required("capture_id", "STRING"),
     ),
 ]
 
@@ -162,8 +216,12 @@ def build_contract() -> Dict[str, Any]:
             "event_history": 1024,
             "banks": 4096,
             "checkpoints": 4096,
+            "keyboard_feed_bytes": 255,
             "memory_read_bytes": 65_536,
             "memory_write_bytes": 65_536,
+            "snapshot_filename_bytes": 255,
+            "state_capture_bytes": 16_384,
+            "display_capture_chunk_bytes": 16_384,
         },
         "methods": METHODS,
     }

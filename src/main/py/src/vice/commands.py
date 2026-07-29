@@ -559,6 +559,18 @@ def sync_result(kind: str, result, remaining_ms):
         prepared = STATE.require_vice().registers_get(
             timeout_ms=remaining_ms()
         )
+    elif kind == "snapshot_load":
+        vice = STATE.require_vice()
+        memory = vice.memory_get(
+            arch.RAM_START,
+            arch.RAM_END,
+            timeout_ms=remaining_ms(),
+        )
+        prepared = (
+            vice.registers_get(timeout_ms=remaining_ms()),
+            vice.checkpoint_list(timeout_ms=remaining_ms()),
+            memory,
+        )
     elif kind.startswith("memory:") and not isinstance(result, bytes):
         _prefix, start_text, memspace_text, bank_text = kind.split(":")
         start = int(start_text)
@@ -584,6 +596,14 @@ def sync_result(kind: str, result, remaining_ms):
                     put_registers(prepared)
                 elif kind == "reset":
                     put_registers(prepared)
+                elif kind == "snapshot_load":
+                    registers, checkpoints, memory = prepared
+                    trace.snapshot("VICE snapshot loaded")
+                    set_process_state_inner("STOPPED")
+                    put_registers(registers)
+                    put_breakpoints_from(checkpoints)
+                    trace.put_bytes(Address("RAM", arch.RAM_START), memory)
+                    put_event_thread()
                 elif kind == "banks":
                     put_environment(prepared)
                 elif kind == "checkpoints":
@@ -600,6 +620,17 @@ def sync_result(kind: str, result, remaining_ms):
                     raise ValueError(f"Unsupported trace sync kind: {kind}")
         finally:
             _end_batch_checked(client, "sync_trace")
+        if kind == "snapshot_load":
+            registers, _checkpoints, _memory = prepared
+            pc = registers.get("PC", registers.get("pc", 0))
+            trace.save()
+            with trace.open_tx("Disassemble"):
+                trace.disassemble(Address("RAM", pc))
+            with trace.open_tx("Activate"):
+                trace.proxy_object_path(FRAME_PATH).activate()
+            snap = trace.snap()
+            return int(snap) if snap is not None else None
+    return None
 
 
 def put_breakpoints_from(checkpoints):

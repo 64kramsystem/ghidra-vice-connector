@@ -391,3 +391,44 @@ class TestCpuOpToKindsExhaustive:
                 assert 'WRITE' in result
             else:
                 assert 'WRITE' not in result
+
+
+def test_snapshot_load_sync_refreshes_entire_machine_state():
+    vice = make_mock_vice()
+    vice.memory_get.return_value = b"\x00" * 0x10000
+    controller = MagicMock(client=vice)
+    commands.STATE.controller = controller
+    commands.STATE.client = MagicMock()
+    commands.STATE.trace = make_mock_trace()
+    commands.STATE.trace.snap.return_value = 12
+
+    snapshot = commands.sync_result(
+        "snapshot_load", 0xC000, lambda: 1000
+    )
+
+    assert snapshot == 12
+    vice.registers_get.assert_called_once_with(timeout_ms=1000)
+    vice.checkpoint_list.assert_called_once_with(timeout_ms=1000)
+    vice.memory_get.assert_called_once_with(
+        0x0000, 0xFFFF, timeout_ms=1000
+    )
+    commands.STATE.trace.snapshot.assert_called_once_with(
+        "VICE snapshot loaded"
+    )
+    address, memory = commands.STATE.trace.put_bytes.call_args.args
+    assert address.space == "RAM"
+    assert address.offset == 0
+    assert memory == b"\x00" * 0x10000
+    commands.STATE.trace.save.assert_called_once_with()
+    disassembly_address = (
+        commands.STATE.trace.disassemble.call_args.args[0]
+    )
+    assert disassembly_address.space == "RAM"
+    assert disassembly_address.offset == 0xC000
+    commands.STATE.trace.proxy_object_path.assert_any_call(
+        commands.FRAME_PATH
+    )
+    (
+        commands.STATE.trace.proxy_object_path.return_value.activate
+        .assert_called_once_with()
+    )

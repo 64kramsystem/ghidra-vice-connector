@@ -11,6 +11,7 @@ from bmp_helpers import (
     MockViceServer,
     build_registers_get_body,
 )
+from vice import protocol
 from vice.protocol import (
     CMD_BANKS_AVAILABLE,
     CMD_CHECKPOINT_DELETE,
@@ -24,6 +25,7 @@ from vice.protocol import (
     CPU_OP_EXEC,
     CPU_OP_LOAD,
     CPU_OP_STORE,
+    Frame,
     RESP_BANKS_AVAILABLE,
     RESP_CHECKPOINT_DELETE,
     RESP_CHECKPOINT_INFO,
@@ -141,6 +143,38 @@ def test_full_64k_read_chunks_without_wrapping(connected_client):
     assert ranges == [(0, 0xFFFE), (0xFFFF, 0xFFFF)]
 
 
+def test_full_64k_read_shares_one_deadline(monkeypatch):
+    ticks = iter((100.0, 100.1, 100.4))
+    monkeypatch.setattr(protocol.time, "monotonic", lambda: next(ticks))
+    client = ViceBmpClient()
+    first = b"\x00" * 0xFFFF
+    second = b"\x00"
+    client.command = MagicMock(
+        side_effect=[
+            Frame(
+                RESP_MEMORY_GET,
+                0,
+                1,
+                struct.pack("<H", len(first)) + first,
+            ),
+            Frame(
+                RESP_MEMORY_GET,
+                0,
+                2,
+                struct.pack("<H", len(second)) + second,
+            ),
+        ]
+    )
+
+    assert len(client.memory_get(0, 0xFFFF, timeout_ms=1_000)) == 0x10000
+    budgets = [
+        call.kwargs["timeout_ms"]
+        for call in client.command.call_args_list
+    ]
+    assert len(budgets) == 2
+    assert 0 < budgets[1] < budgets[0] <= 1_000
+
+
 def test_memory_get_rejects_wrong_length(connected_client):
     client, server = connected_client
     server.handle(CMD_MEMORY_GET, lambda _: memory_response(b"\x00"))
@@ -153,6 +187,23 @@ def test_memory_get_with_side_effects_marks_timeout_as_mutating():
     client.command = MagicMock(side_effect=ViceTimeoutError("fixture"))
     with pytest.raises(ViceTimeoutError):
         client.memory_get(0, 0, side_effects=True)
+    assert client.command.call_args.kwargs["mutating"] is True
+
+
+@pytest.mark.parametrize("timeout_ms", [-1, 0, 55_001])
+def test_memory_get_validates_shared_timeout_before_io(timeout_ms):
+    client = ViceBmpClient()
+    client.command = MagicMock()
+    with pytest.raises(ViceValidationError, match="1..55000"):
+        client.memory_get(0, 0xFFFF, timeout_ms=timeout_ms)
+    client.command.assert_not_called()
+
+
+def test_snapshot_save_timeout_reports_unknown_external_outcome():
+    client = ViceBmpClient()
+    client.command = MagicMock(side_effect=ViceTimeoutError("fixture"))
+    with pytest.raises(ViceTimeoutError):
+        client.snapshot_save("/tmp/state.vsf")
     assert client.command.call_args.kwargs["mutating"] is True
 
 
@@ -171,6 +222,23 @@ def test_memory_set_frame(connected_client):
     ]
     assert seen["header"] == (0, 0xC000, 0xC002, 0, 0)
     assert seen["data"] == b"\xA9\x42\x60"
+
+
+def test_full_64k_write_shares_one_deadline(monkeypatch):
+    ticks = iter((100.0, 100.1, 100.4))
+    monkeypatch.setattr(protocol.time, "monotonic", lambda: next(ticks))
+    client = ViceBmpClient()
+    client.command = MagicMock()
+
+    assert client.memory_set(
+        0, b"\x00" * 0x10000, timeout_ms=1_000
+    ) == [(0, 0xFFFE), (0xFFFF, 0xFFFF)]
+    budgets = [
+        call.kwargs["timeout_ms"]
+        for call in client.command.call_args_list
+    ]
+    assert len(budgets) == 2
+    assert 0 < budgets[1] < budgets[0] <= 1_000
 
 
 @pytest.mark.parametrize(
