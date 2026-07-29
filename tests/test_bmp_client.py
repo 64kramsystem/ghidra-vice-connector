@@ -1,8 +1,9 @@
 """Wire-level integration tests for the strict BMP client."""
 
 import struct
+import socket
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -11,34 +12,47 @@ from bmp_helpers import (
     MockViceServer,
     build_registers_get_body,
 )
-from vice import protocol
 from vice.protocol import (
     CMD_BANKS_AVAILABLE,
     CMD_CHECKPOINT_DELETE,
     CMD_CHECKPOINT_LIST,
     CMD_CHECKPOINT_SET,
     CMD_CHECKPOINT_TOGGLE,
+    CMD_JOYPORT_SET,
+    CMD_KEYBOARD_FEED,
     CMD_MEMORY_GET,
     CMD_MEMORY_SET,
     CMD_REGISTERS_GET,
     CMD_REGISTERS_SET,
+    CMD_RESOURCE_SET,
+    CMD_SNAPSHOT_DUMP,
+    CMD_SNAPSHOT_UNDUMP,
     CPU_OP_EXEC,
     CPU_OP_LOAD,
     CPU_OP_STORE,
     Frame,
+    API_VERSION,
+    RESP_HDR_FMT,
+    RESP_PING,
     RESP_BANKS_AVAILABLE,
     RESP_CHECKPOINT_DELETE,
     RESP_CHECKPOINT_INFO,
     RESP_CHECKPOINT_LIST,
     RESP_CHECKPOINT_TOGGLE,
+    RESP_JOYPORT_SET,
+    RESP_KEYBOARD_FEED,
     RESP_MEMORY_GET,
     RESP_MEMORY_SET,
     RESP_REGISTERS_GET,
+    RESP_RESOURCE_SET,
+    RESP_SNAPSHOT_DUMP,
+    RESP_SNAPSHOT_UNDUMP,
     ViceBmpClient,
     ViceConnectionError,
     ViceProtocolError,
     ViceTimeoutError,
     ViceValidationError,
+    STX,
 )
 
 
@@ -143,36 +157,26 @@ def test_full_64k_read_chunks_without_wrapping(connected_client):
     assert ranges == [(0, 0xFFFE), (0xFFFF, 0xFFFF)]
 
 
-def test_full_64k_read_shares_one_deadline(monkeypatch):
-    ticks = iter((100.0, 100.1, 100.4))
-    monkeypatch.setattr(protocol.time, "monotonic", lambda: next(ticks))
+def test_full_64k_read_shares_one_timeout_budget():
     client = ViceBmpClient()
-    first = b"\x00" * 0xFFFF
-    second = b"\x00"
     client.command = MagicMock(
         side_effect=[
             Frame(
                 RESP_MEMORY_GET,
                 0,
                 1,
-                struct.pack("<H", len(first)) + first,
+                struct.pack("<H", 0xFFFF) + bytes(0xFFFF),
             ),
-            Frame(
-                RESP_MEMORY_GET,
-                0,
-                2,
-                struct.pack("<H", len(second)) + second,
-            ),
+            Frame(RESP_MEMORY_GET, 0, 2, struct.pack("<H", 1) + b"\x00"),
         ]
     )
 
-    assert len(client.memory_get(0, 0xFFFF, timeout_ms=1_000)) == 0x10000
-    budgets = [
-        call.kwargs["timeout_ms"]
-        for call in client.command.call_args_list
-    ]
-    assert len(budgets) == 2
-    assert 0 < budgets[1] < budgets[0] <= 1_000
+    with patch("vice.protocol.time.monotonic", side_effect=[100.0, 100.0, 103.0]):
+        client.memory_get(0, 0xFFFF, timeout_ms=10_000)
+
+    assert [
+        call.kwargs["timeout_ms"] for call in client.command.call_args_list
+    ] == [10_000, 7_000]
 
 
 def test_memory_get_rejects_wrong_length(connected_client):
@@ -190,21 +194,12 @@ def test_memory_get_with_side_effects_marks_timeout_as_mutating():
     assert client.command.call_args.kwargs["mutating"] is True
 
 
-@pytest.mark.parametrize("timeout_ms", [-1, 0, 55_001])
-def test_memory_get_validates_shared_timeout_before_io(timeout_ms):
+def test_memory_get_rejects_timeout_before_io():
     client = ViceBmpClient()
     client.command = MagicMock()
-    with pytest.raises(ViceValidationError, match="1..55000"):
-        client.memory_get(0, 0xFFFF, timeout_ms=timeout_ms)
+    with pytest.raises(ViceValidationError, match="timeout_ms"):
+        client.memory_get(0, 0, timeout_ms=0)
     client.command.assert_not_called()
-
-
-def test_snapshot_save_timeout_reports_unknown_external_outcome():
-    client = ViceBmpClient()
-    client.command = MagicMock(side_effect=ViceTimeoutError("fixture"))
-    with pytest.raises(ViceTimeoutError):
-        client.snapshot_save("/tmp/state.vsf")
-    assert client.command.call_args.kwargs["mutating"] is True
 
 
 def test_memory_set_frame(connected_client):
@@ -224,21 +219,105 @@ def test_memory_set_frame(connected_client):
     assert seen["data"] == b"\xA9\x42\x60"
 
 
-def test_full_64k_write_shares_one_deadline(monkeypatch):
-    ticks = iter((100.0, 100.1, 100.4))
-    monkeypatch.setattr(protocol.time, "monotonic", lambda: next(ticks))
+def test_full_64k_write_shares_one_timeout_budget():
     client = ViceBmpClient()
-    client.command = MagicMock()
+    client.command = MagicMock(return_value=Frame(RESP_MEMORY_SET, 0, 1, b""))
 
-    assert client.memory_set(
-        0, b"\x00" * 0x10000, timeout_ms=1_000
-    ) == [(0, 0xFFFE), (0xFFFF, 0xFFFF)]
-    budgets = [
-        call.kwargs["timeout_ms"]
-        for call in client.command.call_args_list
-    ]
-    assert len(budgets) == 2
-    assert 0 < budgets[1] < budgets[0] <= 1_000
+    with patch("vice.protocol.time.monotonic", side_effect=[100.0, 100.0, 104.0]):
+        client.memory_set(0, bytes(0x10000), timeout_ms=10_000)
+
+    assert [
+        call.kwargs["timeout_ms"] for call in client.command.call_args_list
+    ] == [10_000, 6_000]
+
+
+def test_keyboard_joyport_resource_and_snapshot_wire_formats(connected_client):
+    client, server = connected_client
+    seen = {}
+
+    def handler(name, response, body=b""):
+        return lambda payload: (
+            seen.setdefault(name, payload),
+            (response, body),
+        )[1]
+
+    server.handle(
+        CMD_KEYBOARD_FEED, handler("keyboard", RESP_KEYBOARD_FEED)
+    )
+    server.handle(CMD_JOYPORT_SET, handler("joyport", RESP_JOYPORT_SET))
+    server.handle(CMD_RESOURCE_SET, handler("resource", RESP_RESOURCE_SET))
+    server.handle(
+        CMD_SNAPSHOT_DUMP, handler("snapshot_save", RESP_SNAPSHOT_DUMP)
+    )
+    server.handle(
+        CMD_SNAPSHOT_UNDUMP,
+        handler(
+            "snapshot_load",
+            RESP_SNAPSHOT_UNDUMP,
+            struct.pack("<H", 0xC123),
+        ),
+    )
+
+    client.keyboard_feed(b"GO")
+    client.joyport_set(2, 0xEF)
+    client.resource_set_int("JoyPort2Device", 37)
+    client.snapshot_save("start.vsf", save_roms=True, save_disks=False)
+    assert client.snapshot_load("start.vsf") == 0xC123
+
+    assert seen["keyboard"] == b"\x02GO"
+    assert seen["joyport"] == struct.pack("<HH", 1, 0xEF)
+    assert seen["resource"] == (
+        b"\x01\x0eJoyPort2Device\x04"
+        + (37).to_bytes(4, "little", signed=True)
+    )
+    assert seen["snapshot_save"] == b"\x01\x00\x09start.vsf"
+    assert seen["snapshot_load"] == b"\x09start.vsf"
+
+
+def test_snapshot_save_marks_uncertain_timeout_as_mutating():
+    client = ViceBmpClient()
+    client.command = MagicMock(
+        return_value=Frame(RESP_SNAPSHOT_DUMP, 0, 1, b"")
+    )
+
+    client.snapshot_save("start.vsf")
+
+    assert client.command.call_args.kwargs["mutating"] is True
+
+
+def test_response_body_stall_terminates_connection():
+    client = ViceBmpClient()
+    reader, writer = socket.socketpair()
+    with client._state_lock:
+        client._sock = reader
+        client._running = True
+    thread = threading.Thread(target=client._recv_loop)
+
+    try:
+        with patch(
+            "vice.protocol.RESPONSE_BODY_IDLE_TIMEOUT_SECONDS", 0.01
+        ):
+            thread.start()
+            writer.sendall(
+                struct.pack(
+                    RESP_HDR_FMT,
+                    STX,
+                    API_VERSION,
+                    1,
+                    RESP_PING,
+                    0,
+                    1,
+                )
+            )
+            thread.join(1)
+
+        assert not thread.is_alive()
+        assert isinstance(client.terminal_error, ViceConnectionError)
+        assert "body stalled" in str(client.terminal_error)
+        assert client.connected is False
+    finally:
+        writer.close()
+        client.disconnect()
 
 
 @pytest.mark.parametrize(

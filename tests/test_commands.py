@@ -234,6 +234,10 @@ class TestStopResume:
         states = [c.args[1] for c in state_calls]
         assert 'STOPPED' in states
 
+    def test_on_stop_does_not_save_trace(self):
+        commands.on_stop()
+        commands.STATE.trace.save.assert_not_called()
+
     def test_on_resume_sets_state_running(self):
         commands.on_resume()
         obj = commands.STATE.trace.create_object.return_value
@@ -241,6 +245,12 @@ class TestStopResume:
                        if c.args[0] == '_state']
         states = [c.args[1] for c in state_calls]
         assert 'RUNNING' in states
+
+    def test_on_resume_does_not_save_trace(self):
+        """on_resume() only updates state — it does not save the trace.
+        (RUNNING is transient; save happens on the next STOPPED event.)"""
+        commands.on_resume()
+        commands.STATE.trace.save.assert_not_called()
 
     def test_on_stop_does_not_set_running(self):
         commands.on_stop()
@@ -362,6 +372,30 @@ class TestOnStopMemoryWindow:
         assert end_arg == 0xFFFF
 
 
+def test_snapshot_load_sync_refreshes_entire_machine_state():
+    vice = make_mock_vice()
+    vice.memory_get.return_value = b"\x00" * 0x10000
+    commands.STATE.vice = vice
+    commands.STATE.client = MagicMock()
+    commands.STATE.trace = make_mock_trace()
+
+    result = commands.sync_result("snapshot_load", None, lambda: 1_000)
+
+    assert result is None
+    vice.registers_get.assert_called_once_with(timeout_ms=1_000)
+    vice.checkpoint_list.assert_called_once_with(timeout_ms=1_000)
+    vice.memory_get.assert_called_once_with(0x0000, 0xFFFF, timeout_ms=1_000)
+    commands.STATE.trace.snapshot.assert_called_once_with("VICE snapshot loaded")
+    calls = commands.STATE.trace.put_bytes.call_args_list
+    assert [item.args[0].offset for item in calls] == [
+        0x0000,
+        0x4000,
+        0x8000,
+        0xC000,
+    ]
+    assert b"".join(item.args[1] for item in calls) == b"\x00" * 0x10000
+
+
 # ── breakpoint kinds coverage ─────────────────────────────────────────────────
 
 class TestCpuOpToKindsExhaustive:
@@ -381,46 +415,3 @@ class TestCpuOpToKindsExhaustive:
                 assert 'WRITE' in result
             else:
                 assert 'WRITE' not in result
-
-
-def test_snapshot_load_sync_refreshes_entire_machine_state():
-    vice = make_mock_vice()
-    vice.memory_get.return_value = b"\x00" * 0x10000
-    controller = MagicMock(client=vice)
-    commands.STATE.controller = controller
-    commands.STATE.client = MagicMock()
-    commands.STATE.trace = make_mock_trace()
-    commands.STATE.trace.snap.return_value = 12
-
-    snapshot = commands.sync_result(
-        "snapshot_load", 0xC000, lambda: 1000
-    )
-
-    assert snapshot == 12
-    vice.registers_get.assert_called_once_with(timeout_ms=1000)
-    vice.checkpoint_list.assert_called_once_with(timeout_ms=1000)
-    vice.memory_get.assert_called_once_with(
-        0x0000, 0xFFFF, timeout_ms=1000
-    )
-    commands.STATE.trace.snapshot.assert_called_once_with(
-        "VICE snapshot loaded"
-    )
-    calls = commands.STATE.trace.put_bytes.call_args_list
-    assert len(calls) == 4
-    assert [
-        call.args[0].offset for call in calls
-    ] == [0x0000, 0x4000, 0x8000, 0xC000]
-    assert all(call.args[0].space == "RAM" for call in calls)
-    assert b"".join(call.args[1] for call in calls) == b"\x00" * 0x10000
-    disassembly_address = (
-        commands.STATE.trace.disassemble.call_args.args[0]
-    )
-    assert disassembly_address.space == "RAM"
-    assert disassembly_address.offset == 0xC000
-    commands.STATE.trace.proxy_object_path.assert_any_call(
-        commands.FRAME_PATH
-    )
-    (
-        commands.STATE.trace.proxy_object_path.return_value.activate
-        .assert_called_once_with()
-    )

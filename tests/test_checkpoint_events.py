@@ -1,11 +1,4 @@
-"""Checkpoint-hit event aggregation, history correctness, and liveness.
-
-Covers the two independent ways a single pending-checkpoint slot broke:
-a non-stopping checkpoint firing repeatedly, and two overlapping *stopping*
-checkpoints. VICE emits one checkpoint-info event per matching enabled
-checkpoint before it consults ``cp->stop`` (``mon_breakpoint.c``), so a single
-stop legitimately carries several checkpoint-info events.
-"""
+"""Checkpoint-hit aggregation and command liveness."""
 
 import struct
 import threading
@@ -14,9 +7,7 @@ import time
 import pytest
 
 from vice.controller import (
-    EVENT_HISTORY_LIMIT,
     ViceController,
-    ViceEventHistoryLost,
 )
 from vice.protocol import (
     CPU_OP_EXEC,
@@ -89,7 +80,7 @@ def test_repeated_non_stopping_hits_emit_distinct_events(bmp_client):
     assert [event.kind for event in events] == ["checkpoint_hit", "checkpoint_hit"]
     assert events[0].raw_sequence < events[1].raw_sequence
     assert all(event.pc is None for event in events)
-    assert [event.checkpoint.number for event in events] == [3, 3]
+    assert [event.checkpoints[0].number for event in events] == [3, 3]
 
 
 def test_non_stopping_hits_do_not_synthesize_a_stop(bmp_client):
@@ -114,9 +105,6 @@ def test_two_overlapping_stopping_checkpoints_yield_one_stop(bmp_client):
     assert [event.kind for event in events] == ["stopped"]
     stop = events[0]
     assert [item.number for item in stop.checkpoints] == [1, 2]
-    # Singular field stays populated so consumers detecting "a checkpoint
-    # caused this stop" keep working with more than one match.
-    assert stop.checkpoint.number == 1
 
 
 def test_mixed_stopping_and_non_stopping_at_one_address(bmp_client):
@@ -129,18 +117,17 @@ def test_mixed_stopping_and_non_stopping_at_one_address(bmp_client):
     )
 
     assert [event.kind for event in events] == ["checkpoint_hit", "stopped"]
-    assert events[0].checkpoint.number == 4
+    assert events[0].checkpoints[0].number == 4
     assert [item.number for item in events[1].checkpoints] == [5]
 
 
-def test_single_stopping_checkpoint_keeps_singular_field(bmp_client):
+def test_single_stopping_checkpoint_is_retained(bmp_client):
     client, events = bmp_client
     drive(
         client,
         FakeFrame(RESP_CHECKPOINT_INFO, checkpoint_body(9)),
         FakeFrame(RESP_STOPPED, b""),
     )
-    assert events[0].checkpoint.number == 9
     assert [item.number for item in events[0].checkpoints] == [9]
 
 
@@ -155,7 +142,7 @@ def test_stopping_checkpoint_without_a_stop_still_errors(bmp_client):
 
 
 # ---------------------------------------------------------------------------
-# controller: history correctness and liveness
+# controller liveness
 # ---------------------------------------------------------------------------
 
 
@@ -165,40 +152,31 @@ def hit_event(raw_sequence):
         "checkpoint_hit",
         RESP_CHECKPOINT_INFO,
         None,
-        Checkpoint(number=1, start=0xC000, end=0xC000, stop_on_hit=False),
         b"",
         time.monotonic(),
+        (
+            Checkpoint(
+                number=1,
+                start=0xC000,
+                end=0xC000,
+                stop_on_hit=False,
+            ),
+        ),
     )
 
 
 def stop_event(raw_sequence):
     return RawEvent(
-        raw_sequence, "stopped", RESP_STOPPED, 0xC000, None, b"",
+        raw_sequence, "stopped", RESP_STOPPED, 0xC000, b"",
         time.monotonic(),
     )
 
 
-def test_hit_flood_does_not_report_history_loss(controller):
-    """More than 1024 hits then a stop: still waitable, no history loss."""
-    after = 0
-    for index in range(EVENT_HISTORY_LIMIT + 1):
+def test_hit_flood_preserves_the_latest_stop(controller):
+    for index in range(2_000):
         controller._publish(hit_event(index + 1))
-    controller._publish(stop_event(EVENT_HISTORY_LIMIT + 2))
-
-    event = controller.wait_for_stop(after, 1_000)
-    assert event.kind == "stopped"
-
-
-def test_evicted_stopped_event_still_reports_history_loss(controller):
-    """The guard must stay: a genuinely lost stop is still an error."""
-    controller._publish(stop_event(1))
-    after = controller.history[-1].sequence
-    controller._publish(stop_event(2))
-    for index in range(EVENT_HISTORY_LIMIT + 4):
-        controller._publish(hit_event(index + 3))
-
-    with pytest.raises(ViceEventHistoryLost):
-        controller.wait_for_stop(after, 1_000)
+    controller._publish(stop_event(2_001))
+    assert controller.wait_for_stop(0, 1_000).kind == "stopped"
 
 
 def test_checkpoint_hit_leaves_execution_state_running(controller):

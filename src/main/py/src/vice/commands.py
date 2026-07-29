@@ -111,7 +111,7 @@ class State:
 
 STATE = State()
 
-# Serialize ALL trace operations (transactions, batches, activate).
+# Serialize all trace operations.
 # Multiple threads (method executor, event worker, Ghidra refresh callbacks)
 # compete for the trace lock, causing "Unable to lock due to active transaction"
 # errors and snap mismatches.
@@ -196,8 +196,9 @@ def _end_batch_checked(client, where):
     ghidratrace's Batch._get_result catches BaseException and *returns* the exception object
     instead of raising, so end_batch() hands back a list that may contain exceptions. All three
     call sites here discarded it, which meant a failed queued operation -- an endTx among them --
-    left no trace in this process and made the next trace operation fail without exposing the
-    original cause.
+    left no trace in this process. The next statement was trace.save(), and if the transaction
+    had not actually closed Ghidra answered "Can't save during transaction", killing the agent
+    with no indication of the real cause.
 
     Note end_batch() returns None when the batch is nested and the refcount has not reached zero;
     only the outermost end_batch waits on the futures.
@@ -545,8 +546,6 @@ def sync_event(event, remaining_ms):
         on_resume()
     else:
         raise ValueError(f"Unsupported controller event kind: {event.kind}")
-    snap = STATE.require_trace().snap()
-    return int(snap) if snap is not None else None
 
 
 def sync_result(kind: str, result, remaining_ms):
@@ -560,15 +559,14 @@ def sync_result(kind: str, result, remaining_ms):
         )
     elif kind == "snapshot_load":
         vice = STATE.require_vice()
-        memory = vice.memory_get(
-            arch.RAM_START,
-            arch.RAM_END,
-            timeout_ms=remaining_ms(),
-        )
         prepared = (
             vice.registers_get(timeout_ms=remaining_ms()),
             vice.checkpoint_list(timeout_ms=remaining_ms()),
-            memory,
+            vice.memory_get(
+                arch.RAM_START,
+                arch.RAM_END,
+                timeout_ms=remaining_ms(),
+            ),
         )
     elif kind.startswith("memory:") and not isinstance(result, bytes):
         _prefix, start_text, memspace_text, bank_text = kind.split(":")
@@ -628,9 +626,6 @@ def sync_result(kind: str, result, remaining_ms):
                 trace.disassemble(Address("RAM", pc))
             with trace.open_tx("Activate"):
                 trace.proxy_object_path(FRAME_PATH).activate()
-            snap = trace.snap()
-            return int(snap) if snap is not None else None
-    return None
 
 
 def put_breakpoints_from(checkpoints):
