@@ -7,6 +7,7 @@ The socket reader never acquires the operation lock or updates a Ghidra trace.
 from __future__ import annotations
 
 import collections
+import hashlib
 import threading
 import time
 import uuid
@@ -31,6 +32,8 @@ from .protocol import (
 )
 
 EVENT_HISTORY_LIMIT = 1024
+JOYPORT_DEVICE_IO_SIMULATION = 37
+MAX_STATE_CAPTURE_BYTES = 16 * 1024
 
 # Unsolicited events published per operation_lock acquisition. Bounded so a
 # continuous checkpoint-hit stream cannot starve commands.
@@ -49,6 +52,40 @@ class ViceEventHistoryLost(ViceFailure):
         super().__init__(
             f"requested VICE event history is older than retained sequence "
             f"{oldest_retained}"
+        )
+
+
+class ViceSequenceMismatch(ViceFailure):
+    code = "vice_sequence_mismatch"
+
+    def __init__(
+        self,
+        *,
+        expected_event_sequence: int,
+        actual_event_sequence: int,
+        expected_command_sequence: int,
+        actual_command_sequence: int,
+        pending_events: bool = False,
+    ):
+        self.expected_event_sequence = expected_event_sequence
+        self.actual_event_sequence = actual_event_sequence
+        self.expected_command_sequence = expected_command_sequence
+        self.actual_command_sequence = actual_command_sequence
+        self.pending_events = pending_events
+        detail = " and unpublished VICE events are pending" if pending_events else ""
+        super().__init__(
+            "capture sequence mismatch: expected event/command "
+            f"{expected_event_sequence}/{expected_command_sequence}, observed "
+            f"{actual_event_sequence}/{actual_command_sequence}{detail}"
+        )
+
+
+class ViceDisplayCaptureNotFound(ViceFailure):
+    code = "display_capture_not_found"
+
+    def __init__(self):
+        super().__init__(
+            "display capture token is stale, discarded, or was never created"
         )
 
 
@@ -107,9 +144,38 @@ class OperationResult:
     preceding_events: Tuple[PublicEvent, ...] = ()
 
 
+@dataclass(frozen=True)
+class CapturedMemory:
+    memspace: int
+    bank_id: int
+    start: int
+    end: int
+    data: bytes
+
+
+@dataclass(frozen=True)
+class StateCapture:
+    connection_generation: int
+    event_sequence: int
+    raw_sequence: int
+    event: Optional[PublicEvent]
+    banks: Tuple[Bank, ...]
+    registers: Dict[str, int]
+    checkpoints: Tuple[Checkpoint, ...]
+    ranges: Tuple[CapturedMemory, ...]
+
+
+@dataclass(frozen=True)
+class DisplayCapture:
+    capture_id: str
+    frame: DisplayFrame
+    palette: Tuple[PaletteEntry, ...]
+    sha256: str
+
+
 RemainingMs = Callable[[], int]
 SyncEvent = Callable[[RawEvent, RemainingMs], Optional[int]]
-SyncResult = Callable[[str, object, RemainingMs], None]
+SyncResult = Callable[[str, object, RemainingMs], Optional[int]]
 
 
 def _no_sync(_event: RawEvent, _remaining_ms: RemainingMs) -> Optional[int]:
@@ -118,7 +184,7 @@ def _no_sync(_event: RawEvent, _remaining_ms: RemainingMs) -> Optional[int]:
 
 def _no_result_sync(
     _kind: str, _result: object, _remaining_ms: RemainingMs
-) -> None:
+) -> Optional[int]:
     return None
 
 
@@ -153,6 +219,7 @@ class ViceController:
         self._execution_state = "unknown"
         self._terminal_error: Optional[ViceConnectionError] = None
         self._last_snapshot: Optional[int] = None
+        self._last_evicted_sequence = 0
         self._last_evicted_stopped_sequence = 0
         self._sync_failures: Deque[Tuple[int, str]] = collections.deque(maxlen=128)
         self._coordinator_stop = False
@@ -162,6 +229,7 @@ class ViceController:
         # None on a release build, which reports no revision at all.
         self.vice_revision: Optional[int] = None
         self.banks: Tuple[Bank, ...] = ()
+        self._display_capture: Optional[DisplayCapture] = None
         client.set_event_callback(self._on_raw_event)
         client.set_terminal_callback(self._on_terminal)
 
@@ -262,6 +330,7 @@ class ViceController:
             self._coordinator_stop = True
             self._events_enabled = False
             self._raw_events.clear()
+            self._display_capture = None
             self._condition.notify_all()
 
     def _raise_if_disconnected_locked(self) -> None:
@@ -368,9 +437,11 @@ class ViceController:
             if (
                 self._history.maxlen is not None
                 and len(self._history) == self._history.maxlen
-                and self._history[0].kind == "stopped"
             ):
-                self._last_evicted_stopped_sequence = self._history[0].sequence
+                evicted = self._history[0]
+                self._last_evicted_sequence = evicted.sequence
+                if evicted.kind == "stopped":
+                    self._last_evicted_stopped_sequence = evicted.sequence
             self._history.append(public)
             self._execution_state = (
                 "stopped" if event.kind == "stopped" else "running"
@@ -590,7 +661,21 @@ class ViceController:
             result = callback(remaining_ms)
             if sync_kind is not None:
                 try:
-                    self._sync_result(sync_kind, result, remaining_ms)
+                    snapshot = self._sync_result(
+                        sync_kind, result, remaining_ms
+                    )
+                    with self._condition:
+                        if (
+                            snapshot is not None
+                            and self._last_snapshot is not None
+                            and snapshot < self._last_snapshot
+                        ):
+                            raise ValueError(
+                                "trace snapshot regressed from "
+                                f"{self._last_snapshot} to {snapshot}"
+                            )
+                        if snapshot is not None:
+                            self._last_snapshot = snapshot
                 except ViceTraceSyncError:
                     raise
                 except BaseException as exc:
@@ -723,7 +808,7 @@ class ViceController:
 
     def capture_display(
         self, *, use_vic: bool = True, timeout_ms: int = 10_000
-    ) -> Tuple[int, Tuple[DisplayFrame, List[PaletteEntry]]]:
+    ) -> Tuple[int, DisplayCapture]:
         """Capture one frame together with the palette that renders it.
 
         Requires a stopped target, through `_stopped_call`, and refuses
@@ -752,9 +837,292 @@ class ViceController:
                         f"the {len(palette)}-entry palette, so the frame is "
                         f"not renderable"
                     )
-            return frame, palette
+            result = DisplayCapture(
+                str(uuid.uuid4()),
+                frame,
+                tuple(palette),
+                hashlib.sha256(frame.buffer).hexdigest(),
+            )
+            with self._condition:
+                self._display_capture = result
+            return result
 
         return self._stopped_call(capture, timeout_ms=timeout_ms)
+
+    def read_display_capture(
+        self, capture_id: str, offset: int, max_bytes: int = 16_384
+    ) -> Tuple[int, Tuple[DisplayCapture, bytes]]:
+        if not isinstance(capture_id, str) or not capture_id:
+            raise ViceValidationError("capture_id must be a non-empty string")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+        ):
+            raise ViceValidationError("offset must be non-negative")
+        if (
+            isinstance(max_bytes, bool)
+            or not isinstance(max_bytes, int)
+            or not 1 <= max_bytes <= 16_384
+        ):
+            raise ViceValidationError("max_bytes must be in 1..16384")
+        with self.operation_lock:
+            with self._condition:
+                self._raise_if_disconnected_locked()
+                capture = self._display_capture
+                if capture is None or capture.capture_id != capture_id:
+                    raise ViceDisplayCaptureNotFound()
+                if offset > len(capture.frame.buffer):
+                    raise ViceValidationError(
+                        "offset exceeds the display buffer length"
+                    )
+                sequence = self._next_command_sequence()
+                return (
+                    sequence,
+                    (
+                        capture,
+                        capture.frame.buffer[offset:offset + max_bytes],
+                    ),
+                )
+
+    def discard_display_capture(
+        self, capture_id: str
+    ) -> Tuple[int, None]:
+        if not isinstance(capture_id, str) or not capture_id:
+            raise ViceValidationError("capture_id must be a non-empty string")
+        with self.operation_lock:
+            with self._condition:
+                self._raise_if_disconnected_locked()
+                capture = self._display_capture
+                if capture is None or capture.capture_id != capture_id:
+                    raise ViceDisplayCaptureNotFound()
+                self._display_capture = None
+                return self._next_command_sequence(), None
+
+    def feed_keyboard(
+        self, data: bytes, *, timeout_ms: int = 10_000
+    ) -> Tuple[int, None]:
+        return self._stopped_call(
+            lambda remaining: self.client.keyboard_feed(
+                data, timeout_ms=remaining()
+            ),
+            timeout_ms=timeout_ms,
+        )
+
+    def set_joyport(
+        self, port: int, value: int, *, timeout_ms: int = 10_000
+    ) -> Tuple[int, Dict[str, object]]:
+        """Set raw active-low lines and leave VICE's I/O simulator selected.
+
+        VICE persists this resource if the user later saves emulator settings.
+        The prior device is returned so a caller can restore it explicitly.
+        """
+        if port not in (1, 2) or isinstance(port, bool):
+            raise ViceValidationError("port must be 1 or 2")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 0xFF
+        ):
+            raise ViceValidationError(
+                "joyport value must be an integer in 0..255"
+            )
+
+        def configure(remaining):
+            resource = f"JoyPort{port}Device"
+            previous = self.client.resource_get_int(
+                resource, timeout_ms=remaining()
+            )
+            # VICE src/joyport/joyport.h: JOYPORT_ID_IO_SIMULATION.
+            changed = previous != JOYPORT_DEVICE_IO_SIMULATION
+            if changed:
+                self.client.resource_set_int(
+                    resource,
+                    JOYPORT_DEVICE_IO_SIMULATION,
+                    timeout_ms=remaining(),
+                )
+            self.client.joyport_set(port, value, timeout_ms=remaining())
+            return {
+                "port": port,
+                "value": value,
+                "previous_device": previous,
+                "device_changed": changed,
+            }
+
+        return self._stopped_call(configure, timeout_ms=timeout_ms)
+
+    def save_snapshot(
+        self,
+        filename: str,
+        *,
+        save_roms: bool = False,
+        save_disks: bool = True,
+        timeout_ms: int = 10_000,
+    ) -> Tuple[int, None]:
+        return self._stopped_call(
+            lambda remaining: self.client.snapshot_save(
+                filename,
+                save_roms=save_roms,
+                save_disks=save_disks,
+                timeout_ms=remaining(),
+            ),
+            timeout_ms=timeout_ms,
+        )
+
+    def load_snapshot(
+        self, filename: str, *, timeout_ms: int = 10_000
+    ) -> Tuple[int, int]:
+        return self._stopped_call(
+            lambda remaining: self.client.snapshot_load(
+                filename, timeout_ms=remaining()
+            ),
+            timeout_ms=timeout_ms,
+            sync_kind="snapshot_load",
+        )
+
+    def capture_state(
+        self,
+        *,
+        expected_event_sequence: int,
+        expected_command_sequence: int,
+        ranges: Sequence[Tuple[int, int, int, int]],
+        register_names: Sequence[str],
+        include_checkpoints: bool = True,
+        timeout_ms: int = 10_000,
+    ) -> Tuple[int, StateCapture]:
+        """Capture exact stopped state with non-side-effecting memory peeks."""
+        for value, name in (
+            (expected_event_sequence, "expected_event_sequence"),
+            (expected_command_sequence, "expected_command_sequence"),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ViceValidationError(f"{name} must be non-negative")
+        if not isinstance(include_checkpoints, bool):
+            raise ViceValidationError("include_checkpoints must be a boolean")
+        if not 1 <= timeout_ms <= 55_000:
+            raise ViceValidationError("timeout_ms must be in 1..55000")
+
+        normalized_ranges = []
+        byte_count = 0
+        for index, item in enumerate(ranges):
+            if len(item) != 4:
+                raise ViceValidationError(
+                    f"capture range {index} must contain four integers"
+                )
+            memspace, bank_id, start, end = item
+            for value, field, maximum in (
+                (memspace, "memspace", 0xFF),
+                (bank_id, "bank_id", 0xFFFF),
+                (start, "start", 0xFFFF),
+                (end, "end", 0xFFFF),
+            ):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value <= maximum
+                ):
+                    raise ViceValidationError(
+                        f"capture range {index} {field} must be in 0..{maximum}"
+                    )
+            if start > end:
+                raise ViceValidationError(
+                    f"capture range {index} must not wrap"
+                )
+            byte_count += end - start + 1
+            normalized_ranges.append((memspace, bank_id, start, end))
+        if byte_count > MAX_STATE_CAPTURE_BYTES:
+            raise ViceValidationError(
+                f"capture ranges total {byte_count} bytes; maximum is "
+                f"{MAX_STATE_CAPTURE_BYTES}"
+            )
+
+        selected_names = list(register_names) or list(
+            self.client.reg_name_to_id
+        )
+        if len(set(selected_names)) != len(selected_names):
+            raise ViceValidationError(
+                "register names must not contain duplicates"
+            )
+        unknown = [
+            name
+            for name in selected_names
+            if name not in self.client.reg_name_to_id
+        ]
+        if unknown:
+            raise ViceValidationError(
+                "unknown register names: " + ", ".join(unknown)
+            )
+
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        remaining = lambda: self._remaining_ms(deadline)
+        with self.operation_lock:
+            # Unlike ordinary stopped calls, this deliberately does not drain
+            # queued events first: doing so can synchronize the trace and issue
+            # BMP reads before the caller's exact sequence guard is checked.
+            with self._condition:
+                self._raise_if_disconnected_locked()
+                mismatch = (
+                    self._public_sequence != expected_event_sequence
+                    or self._command_sequence != expected_command_sequence
+                    or bool(self._raw_events)
+                )
+                if mismatch:
+                    raise ViceSequenceMismatch(
+                        expected_event_sequence=expected_event_sequence,
+                        actual_event_sequence=self._public_sequence,
+                        expected_command_sequence=expected_command_sequence,
+                        actual_command_sequence=self._command_sequence,
+                        pending_events=bool(self._raw_events),
+                    )
+                if self._execution_state != "stopped":
+                    raise ViceStateError(
+                        f"VICE target is {self._execution_state}, not stopped"
+                    )
+                connection_generation = self._connection_generation
+                raw_sequence = self._last_raw_sequence
+                event = self._history[-1] if self._history else None
+                sequence = self._next_command_sequence()
+
+            observed_registers = self.client.registers_get(
+                MEMSPACE_MAIN, timeout_ms=remaining()
+            )
+            registers = {
+                name: observed_registers[name] for name in selected_names
+            }
+            checkpoints = (
+                tuple(self.client.checkpoint_list(timeout_ms=remaining()))
+                if include_checkpoints
+                else ()
+            )
+            captured = []
+            for memspace, bank_id, start, end in normalized_ranges:
+                data = self.client.memory_get(
+                    start,
+                    end,
+                    memspace,
+                    bank_id,
+                    False,
+                    timeout_ms=remaining(),
+                )
+                captured.append(
+                    CapturedMemory(
+                        memspace, bank_id, start, end, data
+                    )
+                )
+            return sequence, StateCapture(
+                connection_generation,
+                expected_event_sequence,
+                raw_sequence,
+                event,
+                tuple(self.banks),
+                registers,
+                checkpoints,
+                tuple(captured),
+            )
 
     def list_checkpoints(
         self, *, timeout_ms: int = 10_000
@@ -874,6 +1242,38 @@ class ViceController:
                     if self._terminal_error is not None else None
                 ),
             }
+
+    def list_events(
+        self, after_sequence: int, limit: int = 128
+    ) -> Tuple[Tuple[PublicEvent, ...], int]:
+        if (
+            isinstance(after_sequence, bool)
+            or not isinstance(after_sequence, int)
+            or after_sequence < 0
+        ):
+            raise ViceValidationError("after_sequence must be non-negative")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= EVENT_HISTORY_LIMIT
+        ):
+            raise ViceValidationError(
+                f"limit must be in 1..{EVENT_HISTORY_LIMIT}"
+            )
+        with self._condition:
+            self._raise_if_disconnected_locked()
+            if after_sequence < self._last_evicted_sequence:
+                raise ViceEventHistoryLost(
+                    self._history[0].sequence
+                    if self._history
+                    else self._last_evicted_sequence
+                )
+            result = tuple(
+                event
+                for event in self._history
+                if event.sequence > after_sequence
+            )[:limit]
+            return result, self._public_sequence
 
     def wait_for_stop(
         self, after_sequence: int, timeout_ms: int

@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- Extended `c64.vice/1` to API minor 1 and surface revision 3 with stopped, serialized keyboard input, raw active-low joyport input (public ports 1/2 map to VICE's wire ports 0/1 and automatically select its I/O-simulation device), VICE snapshot save/load, bounded event-history listing, and atomic state capture. State capture checks the caller's exact event and command sequences before any monitor I/O, uses non-side-effecting memory peeks, shares one timeout budget, and returns registers, checkpoints, banks, named bank-aware ranges, and SHA-256 hashes with a 16 KiB raw-data limit so callers can safely assemble full-memory captures in chunks. Snapshot loads now refresh the complete RAM, registers, checkpoints, active frame, and disassembly in the Ghidra trace.
+- Display capture now keeps one opaque cached frame and returns only its metadata, palette, length, and SHA-256 from `capture_display`. `read_display_capture` retrieves at most 16 KiB per call and `discard_display_capture` releases it; a later capture replaces the token. This avoids carrying a complete frame through one large TraceRMI result.
+- Added Binary Monitor Protocol commands for keyboard feed, resources, joyports, snapshot dump, and snapshot undump. A declared response body that stops arriving now terminates the poisoned connection, while an ordinary caller timeout still permits a late correlated response. Multi-frame memory reads and writes share one caller deadline.
 - `tools/release` now refuses when HEAD is already tagged `v<version>`, instead of reporting nothing to release and exiting 0.
 
 ## 0.100.0

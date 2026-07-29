@@ -176,6 +176,70 @@ class TestLiveRegisters:
         vice.registers_set({'PC': original['PC']})
 
 
+# ── Deterministic automation primitives ─────────────────────────────────────
+
+class TestLiveAutomationPrimitives:
+    def test_keyboard_feed_reaches_the_kernal_queue(self, vice):
+        data = b"QZXJ"
+        vice.memory_set(0x0277, b"\x00" * 10)
+        vice.memory_set(0x00C6, b"\x00")
+        try:
+            sequence, result = vice.controller.feed_keyboard(data)
+            assert sequence > 0
+            assert result is None
+            assert vice.memory_get(0x00C6, 0x00C6) == bytes((len(data),))
+            assert vice.memory_get(
+                0x0277, 0x0277 + len(data) - 1
+            ) == data
+        finally:
+            vice.memory_set(0x00C6, b"\x00")
+
+    def test_joyport_two_controls_cia1_port_a_active_low(self, vice):
+        io_bank = next(
+            (
+                bank for bank in vice.banks_available()
+                if bank.name.lower() == "io"
+            ),
+            None,
+        )
+        assert io_bank is not None, "VICE did not publish its I/O bank"
+        original_device = vice.resource_get_int("JoyPort2Device")
+        try:
+            vice.controller.set_joyport(2, 0xFF)
+            released = vice.memory_get(
+                0xDC00, 0xDC00, bank_id=io_bank.id
+            )[0]
+            vice.controller.set_joyport(2, 0xEF)
+            pressed = vice.memory_get(
+                0xDC00, 0xDC00, bank_id=io_bank.id
+            )[0]
+            assert released & 0x10
+            assert not pressed & 0x10
+        finally:
+            vice.joyport_set(2, 0xFF)
+            vice.resource_set_int("JoyPort2Device", original_device)
+
+    def test_snapshot_roundtrip_restores_register_state(
+        self, vice, tmp_path
+    ):
+        if VICE_HOST not in {"127.0.0.1", "localhost", "::1"}:
+            pytest.skip("snapshot paths require VICE on the pytest host")
+        filename = str(tmp_path / "automation-roundtrip.vsf")
+        original = vice.registers_get()
+        vice.controller.save_snapshot(
+            filename, save_roms=False, save_disks=False
+        )
+        changed = (original["A"] + 1) & 0xFF
+        vice.registers_set({"A": changed})
+        assert vice.registers_get()["A"] == changed
+        _sequence, pc = vice.controller.load_snapshot(filename)
+        time.sleep(0.05)
+        assert vice.controller.execution_state == "stopped"
+        restored = vice.registers_get()
+        assert pc == restored["PC"]
+        assert restored["A"] == original["A"]
+
+
 # ── Memory read/write ────────────────────────────────────────────────────────
 
 class TestLiveMemory:
@@ -362,7 +426,9 @@ class TestLiveReset:
 class TestLiveDisplayCapture:
     def test_capture_returns_a_renderable_c64_frame(self, vice):
         require_display_capture(vice)
-        _sequence, (frame, palette) = vice.capture_display()
+        _sequence, capture = vice.capture_display()
+        frame = capture.frame
+        palette = capture.palette
         assert frame.bits_per_pixel == 8
         assert (frame.inner_width, frame.inner_height) == (320, 200)
         assert len(frame.buffer) == frame.width * frame.height

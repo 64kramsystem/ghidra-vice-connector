@@ -6,8 +6,8 @@ send that command to a real emulator; the fakes below are `MockViceServer`, whic
 is not one.
 """
 
-import base64
 import contextlib
+import hashlib
 import json
 import struct
 import time
@@ -16,7 +16,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from vice import automation, commands
-from vice.controller import ViceController, ViceStateError
+from vice.controller import (
+    DisplayCapture,
+    ViceController,
+    ViceDisplayCaptureNotFound,
+    ViceStateError,
+)
 from vice.protocol import (
     CMD_DISPLAY_GET,
     CMD_PALETTE_GET,
@@ -545,13 +550,18 @@ class TestControllerCapture:
     def test_capture_while_stopped_shares_one_timeout_budget(self):
         client, controller = capture_controller()
         before = controller.command_sequence
-        sequence, (frame, palette) = controller.capture_display(
+        sequence, capture = controller.capture_display(
             timeout_ms=500
         )
         assert sequence == before + 1
         assert controller.command_sequence == before + 1
-        assert frame.buffer == DEFAULT_DISPLAY_BUFFER
-        assert palette == [PaletteEntry(*item) for item in DEFAULT_PALETTE]
+        assert capture.frame.buffer == DEFAULT_DISPLAY_BUFFER
+        assert capture.palette == tuple(
+            PaletteEntry(*item) for item in DEFAULT_PALETTE
+        )
+        assert capture.sha256 == hashlib.sha256(
+            DEFAULT_DISPLAY_BUFFER
+        ).hexdigest()
         display_budget = client.display_calls[0][1]
         palette_budget = client.palette_calls[0][1]
         assert 1 <= palette_budget < display_budget <= 500
@@ -574,16 +584,53 @@ class TestControllerCapture:
             controller.capture_display(timeout_ms=500)
         controller.close()
 
+    def test_cached_frame_is_chunked_replaced_and_discardable(self):
+        client, controller = capture_controller()
+        try:
+            _sequence, first = controller.capture_display(timeout_ms=500)
+            _sequence, (observed, chunk) = controller.read_display_capture(
+                first.capture_id, 1, 3
+            )
+            assert observed is first
+            assert chunk == DEFAULT_DISPLAY_BUFFER[1:4]
+
+            _sequence, second = controller.capture_display(timeout_ms=500)
+            with pytest.raises(ViceDisplayCaptureNotFound):
+                controller.read_display_capture(first.capture_id, 0)
+            controller.discard_display_capture(second.capture_id)
+            with pytest.raises(ViceDisplayCaptureNotFound):
+                controller.read_display_capture(second.capture_id, 0)
+        finally:
+            controller.close()
+
+    @pytest.mark.parametrize("max_bytes", [0, 16_385])
+    def test_chunk_size_is_bounded(self, max_bytes):
+        _client, controller = capture_controller()
+        try:
+            _sequence, capture = controller.capture_display(timeout_ms=500)
+            with pytest.raises(ViceValidationError, match="16384"):
+                controller.read_display_capture(
+                    capture.capture_id, 0, max_bytes
+                )
+        finally:
+            controller.close()
+
 
 # ── Automation surface ────────────────────────────────────────────────────────
 
 class TestCaptureDisplayMethod:
-    def test_result_shape_and_base64_round_trip(self, automation_controller):
+    def test_result_shape_and_chunk_round_trip(self, automation_controller):
         frame = DisplayFrame(384, 272, 32, 35, 320, 200, 8,
                              bytes(range(256)) * 408)
         palette = [PaletteEntry(index, index, index) for index in range(256)]
+        capture = DisplayCapture(
+            "capture-1",
+            frame,
+            tuple(palette),
+            hashlib.sha256(frame.buffer).hexdigest(),
+        )
         automation_controller.capture_display.return_value = (
-            11, (frame, palette)
+            11, capture
         )
         result = payload(automation.capture_display(process(), True, 1000))
         assert result["ok"] is True
@@ -596,7 +643,9 @@ class TestCaptureDisplayMethod:
         }
         assert body["bits_per_pixel"] == 8
         assert body["buffer_length"] == len(frame.buffer)
-        assert base64.b64decode(body["buffer_base64"]) == frame.buffer
+        assert "buffer_base64" not in body
+        assert body["capture_id"] == "capture-1"
+        assert body["buffer_sha256"] == capture.sha256
         assert body["palette"][1] == {"r": 1, "g": 1, "b": 1}
         assert len(body["palette"]) == 256
         assert body["vice_version"] == "3.11.0.0"
@@ -605,19 +654,47 @@ class TestCaptureDisplayMethod:
             use_vic=True, timeout_ms=1000
         )
 
-    def test_base64_is_rfc4648_with_padding(self, automation_controller):
+    def test_chunk_is_lowercase_hex_with_continuation(self, automation_controller):
         frame = DisplayFrame(2, 1, 0, 0, 2, 1, 8, b"\x00\x01")
-        automation_controller.capture_display.return_value = (
-            11, (frame, [PaletteEntry(0, 0, 0), PaletteEntry(1, 1, 1)])
+        capture = DisplayCapture(
+            "capture-1",
+            frame,
+            (PaletteEntry(0, 0, 0), PaletteEntry(1, 1, 1)),
+            hashlib.sha256(frame.buffer).hexdigest(),
         )
-        result = payload(automation.capture_display(process(), True, 1000))
-        assert result["result"]["buffer_base64"] == "AAE="
+        automation_controller.read_display_capture.return_value = (
+            12, (capture, b"\x00")
+        )
+        result = payload(
+            automation.read_display_capture(
+                process(), "capture-1", 0, 1
+            )
+        )
+        assert result["result"]["bytes"] == "00"
+        assert result["result"]["next_offset"] == 1
+        assert result["result"]["complete"] is False
+
+    def test_discard_reports_released_token(self, automation_controller):
+        automation_controller.discard_display_capture.return_value = (13, None)
+        result = payload(
+            automation.discard_display_capture(process(), "capture-1")
+        )
+        assert result["result"] == {
+            "capture_id": "capture-1",
+            "discarded": True,
+        }
 
     def test_svn_build_reports_an_integer_revision(self, automation_controller):
         automation_controller.vice_revision = 46021
         frame = DisplayFrame(2, 1, 0, 0, 2, 1, 8, b"\x00\x00")
+        capture = DisplayCapture(
+            "capture-1",
+            frame,
+            (PaletteEntry(0, 0, 0),),
+            hashlib.sha256(frame.buffer).hexdigest(),
+        )
         automation_controller.capture_display.return_value = (
-            11, (frame, [PaletteEntry(0, 0, 0)])
+            11, capture
         )
         result = payload(automation.capture_display(process(), True, 1000))
         assert result["result"]["vice_revision"] == 46021

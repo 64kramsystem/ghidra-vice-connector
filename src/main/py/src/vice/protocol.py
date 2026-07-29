@@ -11,6 +11,7 @@ from __future__ import annotations
 import collections
 import logging
 import queue
+import select
 import socket
 import struct
 import threading
@@ -31,6 +32,10 @@ MAX_RESPONSE_BODY = 16 * 1024 * 1024
 MAX_LIST_ITEMS = 4096
 MAX_MEMORY_FRAME = 0xFFFF
 MAX_ABANDONED_REQUESTS = 4096
+# Once a response header declares a body, the single reader cannot recover its
+# framing until every byte arrives. Bound idle time between body fragments so
+# a truncated response cannot leave the session falsely connected forever.
+RESPONSE_BODY_IDLE_TIMEOUT_SECONDS = 5.0
 
 CMD_MEMORY_GET = 0x01
 CMD_MEMORY_SET = 0x02
@@ -41,7 +46,12 @@ CMD_CHECKPOINT_LIST = 0x14
 CMD_CHECKPOINT_TOGGLE = 0x15
 CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
+CMD_SNAPSHOT_DUMP = 0x41
+CMD_SNAPSHOT_UNDUMP = 0x42
+CMD_RESOURCE_GET = 0x51
+CMD_RESOURCE_SET = 0x52
 CMD_ADVANCE_INSTRUCTIONS = 0x71
+CMD_KEYBOARD_FEED = 0x72
 CMD_EXECUTE_UNTIL_RETURN = 0x73
 CMD_PING = 0x81
 CMD_BANKS_AVAILABLE = 0x82
@@ -49,6 +59,7 @@ CMD_REGISTERS_AVAILABLE = 0x83
 CMD_DISPLAY_GET = 0x84
 CMD_VICE_INFO = 0x85
 CMD_PALETTE_GET = 0x91
+CMD_JOYPORT_SET = 0xA2
 CMD_EXIT = 0xAA
 CMD_QUIT = 0xBB
 CMD_RESET = 0xCC
@@ -60,9 +71,14 @@ RESP_CHECKPOINT_DELETE = 0x13
 RESP_CHECKPOINT_LIST = 0x14
 RESP_CHECKPOINT_TOGGLE = 0x15
 RESP_REGISTERS_GET = 0x31
+RESP_SNAPSHOT_DUMP = 0x41
+RESP_SNAPSHOT_UNDUMP = 0x42
+RESP_RESOURCE_GET = 0x51
+RESP_RESOURCE_SET = 0x52
 RESP_STOPPED = 0x62
 RESP_RESUMED = 0x63
 RESP_ADVANCE_INSTRUCTIONS = 0x71
+RESP_KEYBOARD_FEED = 0x72
 RESP_EXECUTE_UNTIL_RETURN = 0x73
 RESP_PING = 0x81
 RESP_BANKS_AVAILABLE = 0x82
@@ -70,6 +86,7 @@ RESP_REGISTERS_AVAILABLE = 0x83
 RESP_DISPLAY_GET = 0x84
 RESP_VICE_INFO = 0x85
 RESP_PALETTE_GET = 0x91
+RESP_JOYPORT_SET = 0xA2
 RESP_EXIT = 0xAA
 RESP_RESET = 0xCC
 
@@ -564,6 +581,22 @@ def _validate_bool(value: bool, field: str) -> bool:
     return value
 
 
+def _length_prefixed_text(value: str, field: str) -> bytes:
+    if not isinstance(value, str):
+        raise ViceValidationError(f"{field} must be a string")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ViceValidationError(f"{field} is not valid UTF-8") from exc
+    if not 1 <= len(encoded) <= 0xFF:
+        raise ViceValidationError(
+            f"{field} must encode to between 1 and 255 bytes"
+        )
+    if b"\x00" in encoded:
+        raise ViceValidationError(f"{field} must not contain NUL")
+    return bytes((len(encoded),)) + encoded
+
+
 class ViceBmpClient:
     """One-connection, one-reader, request-correlating BMP client."""
 
@@ -779,13 +812,23 @@ class ViceBmpClient:
                 self._terminate(terminal)
                 raise terminal from exc
 
-    def _recv_exact(self, size: int) -> bytes:
+    def _recv_exact(
+        self, size: int, *, body_idle_timeout: Optional[float] = None
+    ) -> bytes:
         data = bytearray()
         while len(data) < size:
             with self._state_lock:
                 sock = self._sock
             if sock is None:
                 raise ViceConnectionError("VICE monitor connection closed")
+            if body_idle_timeout is not None:
+                readable, _, _ = select.select(
+                    [sock], [], [], body_idle_timeout
+                )
+                if not readable:
+                    raise ViceConnectionError(
+                        "VICE response body stalled after its header"
+                    )
             chunk = sock.recv(size - len(data))
             if not chunk:
                 raise ViceConnectionError("VICE monitor disconnected")
@@ -812,7 +855,13 @@ class ViceBmpClient:
                         f"VICE response body {body_length} exceeds "
                         f"{self.max_response_body}"
                     )
-                body = self._recv_exact(body_length) if body_length else b""
+                body = (
+                    self._recv_exact(
+                        body_length,
+                        body_idle_timeout=RESPONSE_BODY_IDLE_TIMEOUT_SECONDS,
+                    )
+                    if body_length else b""
+                )
                 frame = Frame(response_type, error, request_id, body)
                 if request_id == EVENT_REQUEST_ID:
                     self._receive_event(frame)
@@ -1216,8 +1265,11 @@ class ViceBmpClient:
         _validate_id(memspace, "memspace", 0xFF)
         _validate_id(bank_id, "bank_id")
         _validate_bool(side_effects, "side_effects")
+        if not 1 <= timeout_ms <= 55_000:
+            raise ViceValidationError("timeout_ms must be in 1..55000")
         result = bytearray()
         cursor = start
+        deadline = time.monotonic() + timeout_ms / 1000.0
         while cursor <= end:
             chunk_end = min(end, cursor + MAX_MEMORY_FRAME - 1)
             payload = struct.pack(
@@ -1228,11 +1280,18 @@ class ViceBmpClient:
                 memspace,
                 bank_id,
             )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ViceTimeoutError(
+                    "VICE memory read exhausted its shared timeout",
+                    state_may_have_changed=bool(side_effects),
+                )
+            remaining_ms = max(1, int(remaining * 1000))
             frame = self.command(
                 CMD_MEMORY_GET,
                 payload,
                 expected=RESP_MEMORY_GET,
-                timeout_ms=timeout_ms,
+                timeout_ms=remaining_ms,
                 mutating=bool(side_effects),
             )
             body = Cursor(frame.body, "memory get")
@@ -1266,8 +1325,11 @@ class ViceBmpClient:
         _validate_id(memspace, "memspace", 0xFF)
         _validate_id(bank_id, "bank_id")
         _validate_bool(side_effects, "side_effects")
+        if not 1 <= timeout_ms <= 55_000:
+            raise ViceValidationError("timeout_ms must be in 1..55000")
         completed = []
         offset = 0
+        deadline = time.monotonic() + timeout_ms / 1000.0
         while offset < len(data):
             chunk = data[offset:offset + MAX_MEMORY_FRAME]
             chunk_start = start + offset
@@ -1281,11 +1343,17 @@ class ViceBmpClient:
                 bank_id,
             ) + chunk
             try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ViceTimeoutError(
+                        "VICE memory write exhausted its shared timeout",
+                        state_may_have_changed=True,
+                    )
                 self.command(
                     CMD_MEMORY_SET,
                     payload,
                     expected=RESP_MEMORY_SET,
-                    timeout_ms=timeout_ms,
+                    timeout_ms=max(1, int(remaining * 1000)),
                     mutating=True,
                 )
             except ViceFailure as exc:
@@ -1527,6 +1595,124 @@ class ViceBmpClient:
     def ping(self, *, timeout_ms: int = 10_000) -> bool:
         self.command(CMD_PING, expected=RESP_PING, timeout_ms=timeout_ms)
         return True
+
+    def keyboard_feed(
+        self, data: bytes, *, timeout_ms: int = 10_000
+    ) -> None:
+        if not isinstance(data, bytes):
+            raise ViceValidationError("keyboard data must be bytes")
+        if not 1 <= len(data) <= 0xFF:
+            raise ViceValidationError(
+                "keyboard data must contain between 1 and 255 bytes"
+            )
+        if b"\x00" in data:
+            raise ViceValidationError("keyboard data must not contain NUL")
+        self.command(
+            CMD_KEYBOARD_FEED,
+            bytes((len(data),)) + data,
+            expected=RESP_KEYBOARD_FEED,
+            timeout_ms=timeout_ms,
+            mutating=True,
+        )
+
+    def resource_get_int(
+        self, name: str, *, timeout_ms: int = 10_000
+    ) -> int:
+        frame = self.command(
+            CMD_RESOURCE_GET,
+            _length_prefixed_text(name, "resource name"),
+            expected=RESP_RESOURCE_GET,
+            timeout_ms=timeout_ms,
+        )
+        cur = Cursor(frame.body, f"resource get {name!r}")
+        resource_type = cur.u8()
+        length = cur.u8()
+        value = cur.take(length)
+        cur.finish()
+        if resource_type != 1:
+            raise ViceProtocolError(
+                f"resource {name!r} has type {resource_type}, expected integer"
+            )
+        if length not in (1, 2, 4):
+            raise ViceProtocolError(
+                f"resource {name!r} has unsupported {length}-byte integer"
+            )
+        return int.from_bytes(value, "little", signed=True)
+
+    def resource_set_int(
+        self, name: str, value: int, *, timeout_ms: int = 10_000
+    ) -> None:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not -(1 << 31) <= value < (1 << 31)
+        ):
+            raise ViceValidationError(
+                "resource value must be a signed 32-bit integer"
+            )
+        payload = (
+            b"\x01"
+            + _length_prefixed_text(name, "resource name")
+            + b"\x04"
+            + value.to_bytes(4, "little", signed=True)
+        )
+        self.command(
+            CMD_RESOURCE_SET,
+            payload,
+            expected=RESP_RESOURCE_SET,
+            timeout_ms=timeout_ms,
+            mutating=True,
+        )
+
+    def joyport_set(
+        self, port: int, value: int, *, timeout_ms: int = 10_000
+    ) -> None:
+        if port not in (1, 2) or isinstance(port, bool):
+            raise ViceValidationError("joyport must be 1 or 2")
+        _validate_id(value, "joyport value", 0xFF)
+        # The public API uses the control-port numbers printed on a C64.
+        # VICE's binary monitor uses the zero-based JOYPORT_1/JOYPORT_2 enum.
+        self.command(
+            CMD_JOYPORT_SET,
+            struct.pack("<HH", port - 1, value),
+            expected=RESP_JOYPORT_SET,
+            timeout_ms=timeout_ms,
+            mutating=True,
+        )
+
+    def snapshot_save(
+        self,
+        filename: str,
+        *,
+        save_roms: bool = False,
+        save_disks: bool = True,
+        timeout_ms: int = 10_000,
+    ) -> None:
+        _validate_bool(save_roms, "save_roms")
+        _validate_bool(save_disks, "save_disks")
+        self.command(
+            CMD_SNAPSHOT_DUMP,
+            bytes((int(save_roms), int(save_disks)))
+            + _length_prefixed_text(filename, "snapshot filename"),
+            expected=RESP_SNAPSHOT_DUMP,
+            timeout_ms=timeout_ms,
+            mutating=True,
+        )
+
+    def snapshot_load(
+        self, filename: str, *, timeout_ms: int = 10_000
+    ) -> int:
+        frame = self.command(
+            CMD_SNAPSHOT_UNDUMP,
+            _length_prefixed_text(filename, "snapshot filename"),
+            expected=RESP_SNAPSHOT_UNDUMP,
+            timeout_ms=timeout_ms,
+            mutating=True,
+        )
+        cur = Cursor(frame.body, "snapshot load")
+        pc = cur.u16()
+        cur.finish()
+        return pc
 
     def acknowledge_step(
         self, count: int, step_over: bool, *, timeout_ms: int

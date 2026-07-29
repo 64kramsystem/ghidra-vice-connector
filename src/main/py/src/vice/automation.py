@@ -1,6 +1,6 @@
 """Versioned TraceRMI automation methods for the C64 VICE connector."""
 
-import base64
+import hashlib
 import json
 from typing import Annotated, List
 
@@ -172,6 +172,11 @@ def _failure(controller: ViceController, command: str, error: ViceFailure) -> st
         "memory_may_be_modified",
         "action_applied",
         "trace_sync_failed",
+        "expected_event_sequence",
+        "actual_event_sequence",
+        "expected_command_sequence",
+        "actual_command_sequence",
+        "pending_events",
     ):
         if hasattr(error, name):
             details[name] = getattr(error, name)
@@ -530,27 +535,211 @@ def wait_for_stop(
     return _call(process, "wait_for_stop", invoke)
 
 
+@REGISTRY.method(name="c64_vice_v1_feed_keyboard")
+def feed_keyboard(
+    process: C64, data: bytes, timeout_ms: int = 10_000
+) -> str:
+    def invoke(controller):
+        sequence, _ = controller.feed_keyboard(data, timeout_ms=timeout_ms)
+        return sequence, {"byte_count": len(data)}
+
+    return _call(process, "feed_keyboard", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_set_joyport")
+def set_joyport(
+    process: C64, port: int, value: int, timeout_ms: int = 10_000
+) -> str:
+    """Set raw active-low lines and leave VICE's I/O simulator selected.
+
+    The selected device can persist if emulator settings are later saved.
+    The result reports the previous device for explicit restoration.
+    """
+    return _call(
+        process,
+        "set_joyport",
+        lambda controller: controller.set_joyport(
+            port, value, timeout_ms=timeout_ms
+        ),
+    )
+
+
+@REGISTRY.method(name="c64_vice_v1_save_snapshot")
+def save_snapshot(
+    process: C64,
+    filename: str,
+    save_roms: bool = False,
+    save_disks: bool = True,
+    timeout_ms: int = 10_000,
+) -> str:
+    def invoke(controller):
+        sequence, _ = controller.save_snapshot(
+            filename,
+            save_roms=save_roms,
+            save_disks=save_disks,
+            timeout_ms=timeout_ms,
+        )
+        return sequence, {
+            "filename": filename,
+            "save_roms": save_roms,
+            "save_disks": save_disks,
+        }
+
+    return _call(process, "save_snapshot", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_load_snapshot")
+def load_snapshot(
+    process: C64, filename: str, timeout_ms: int = 10_000
+) -> str:
+    def invoke(controller):
+        sequence, pc = controller.load_snapshot(
+            filename, timeout_ms=timeout_ms
+        )
+        return sequence, {
+            "filename": filename,
+            "pc": pc,
+            "pc_display": _address(pc),
+        }
+
+    return _call(process, "load_snapshot", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_list_events")
+def list_events(
+    process: C64, after_sequence: int, limit: int = 128
+) -> str:
+    def invoke(controller):
+        events, event_sequence = controller.list_events(
+            after_sequence, limit
+        )
+        next_sequence = (
+            events[-1].sequence if events else after_sequence
+        )
+        return controller.command_sequence, {
+            "after_sequence": after_sequence,
+            "events": [_event(event) for event in events],
+            "next_sequence": next_sequence,
+            "event_sequence": event_sequence,
+            "complete": next_sequence >= event_sequence,
+        }
+
+    return _call(process, "list_events", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_capture_state")
+def capture_state(
+    process: C64,
+    expected_event_sequence: int,
+    expected_command_sequence: int,
+    ranges: LongArray,
+    names: StringArray,
+    register_names: StringArray,
+    include_checkpoints: bool = True,
+    timeout_ms: int = 10_000,
+) -> str:
+    """Capture one exact stopped state under a single timeout budget.
+
+    ``ranges`` is a flat sequence of ``(memspace, bank_id, start, end)``
+    quadruples; ``names`` supplies one parallel unique name per quadruple.
+    Ranges are inclusive and may total at most 16 KiB. The operation performs
+    no monitor I/O unless both expected sequence values still match. Memory is
+    always read with Binary Monitor side effects disabled, including I/O.
+    """
+    def invoke(controller):
+        if len(ranges) % 4:
+            raise ViceValidationError(
+                "ranges must contain memspace, bank_id, start, end quadruples"
+            )
+        range_count = len(ranges) // 4
+        if len(names) != range_count:
+            raise ViceValidationError(
+                "names must contain one entry for each capture range"
+            )
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ViceValidationError(
+                "capture range names must be non-empty strings"
+            )
+        if len(set(names)) != len(names):
+            raise ViceValidationError(
+                "capture range names must not contain duplicates"
+            )
+        decoded_ranges = [
+            tuple(ranges[index:index + 4])
+            for index in range(0, len(ranges), 4)
+        ]
+        sequence, capture = controller.capture_state(
+            expected_event_sequence=expected_event_sequence,
+            expected_command_sequence=expected_command_sequence,
+            ranges=decoded_ranges,
+            register_names=register_names,
+            include_checkpoints=include_checkpoints,
+            timeout_ms=timeout_ms,
+        )
+        range_records = []
+        raw_byte_count = 0
+        for name, item in zip(names, capture.ranges):
+            raw_byte_count += len(item.data)
+            range_records.append(
+                {
+                    "name": name,
+                    "memspace": item.memspace,
+                    "bank_id": item.bank_id,
+                    "start": item.start,
+                    "start_display": _address(item.start),
+                    "end": item.end,
+                    "end_display": _address(item.end),
+                    "byte_count": len(item.data),
+                    "bytes": item.data.hex(),
+                    "sha256": hashlib.sha256(item.data).hexdigest(),
+                }
+            )
+        return sequence, {
+            "connection_generation": capture.connection_generation,
+            "event_sequence": capture.event_sequence,
+            "raw_sequence": capture.raw_sequence,
+            "event": (
+                _event(capture.event)
+                if capture.event is not None else None
+            ),
+            "banks": [
+                {"id": bank.id, "name": bank.name}
+                for bank in capture.banks
+            ],
+            "registers": _register_records(
+                controller, capture.registers, register_names
+            ),
+            "checkpoints": [
+                _checkpoint(checkpoint)
+                for checkpoint in capture.checkpoints
+            ],
+            "ranges": range_records,
+            "raw_byte_count": raw_byte_count,
+        }
+
+    return _call(process, "capture_state", invoke)
+
+
 @REGISTRY.method(name="c64_vice_v1_capture_display")
 def capture_display(
     process: C64, use_vic: bool = True, timeout_ms: int = 10_000
 ) -> str:
-    """Return one rendered frame as an indexed buffer plus its palette.
+    """Capture indexed pixels and return metadata plus a chunk-read token.
 
-    Pixels are row-major, one byte per pixel, and each byte is an index into
-    `palette` by array position. `buffer_base64` is standard RFC 4648 base64
-    with padding. No image is encoded here: PNG encoding needs no emulator and
-    is unit-testable upstream.
-
-    `vice_revision` is null on a release build, which reports no revision at
-    all, and carries the integer only for an SVN or nightly build.
+    The reconstructed buffer is row-major with one unsigned palette index per
+    pixel. Each index addresses the correspondingly positioned palette entry.
+    ``vice_revision`` is null for a release build and an integer for an
+    SVN/nightly build.
     """
     def invoke(controller):
         if not isinstance(use_vic, bool):
             raise ViceValidationError("use_vic must be a boolean")
-        sequence, (frame, palette) = controller.capture_display(
+        sequence, capture = controller.capture_display(
             use_vic=use_vic, timeout_ms=timeout_ms
         )
+        frame = capture.frame
         return sequence, {
+            "capture_id": capture.capture_id,
             "width": frame.width,
             "height": frame.height,
             "inner": {
@@ -561,16 +750,58 @@ def capture_display(
             },
             "bits_per_pixel": frame.bits_per_pixel,
             "buffer_length": len(frame.buffer),
-            "buffer_base64": base64.b64encode(frame.buffer).decode("ascii"),
+            "buffer_sha256": capture.sha256,
             "palette": [
                 {"r": entry.r, "g": entry.g, "b": entry.b}
-                for entry in palette
+                for entry in capture.palette
             ],
             "vice_version": controller.vice_version,
             "vice_revision": controller.vice_revision,
         }
 
     return _call(process, "capture_display", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_read_display_capture")
+def read_display_capture(
+    process: C64,
+    capture_id: str,
+    offset: int,
+    max_bytes: int = 16_384,
+) -> str:
+    """Read one bounded slice of a captured row-major indexed-pixel buffer.
+
+    Concatenate chunks in offset order to ``buffer_length`` and verify the
+    resulting bytes against ``buffer_sha256`` before interpreting them.
+    """
+    def invoke(controller):
+        sequence, (capture, data) = controller.read_display_capture(
+            capture_id, offset, max_bytes
+        )
+        next_offset = offset + len(data)
+        length = len(capture.frame.buffer)
+        complete = next_offset >= length
+        return sequence, {
+            "capture_id": capture_id,
+            "offset": offset,
+            "byte_count": len(data),
+            "bytes": data.hex(),
+            "complete": complete,
+            "next_offset": None if complete else next_offset,
+            "buffer_length": length,
+            "buffer_sha256": capture.sha256,
+        }
+
+    return _call(process, "read_display_capture", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_discard_display_capture")
+def discard_display_capture(process: C64, capture_id: str) -> str:
+    def invoke(controller):
+        sequence, _ = controller.discard_display_capture(capture_id)
+        return sequence, {"capture_id": capture_id, "discarded": True}
+
+    return _call(process, "discard_display_capture", invoke)
 
 
 @REGISTRY.method(name="c64_vice_v1_reset")
