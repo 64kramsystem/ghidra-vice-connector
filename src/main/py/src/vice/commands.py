@@ -110,7 +110,7 @@ class State:
 
 STATE = State()
 
-# Serialize ALL trace operations (transactions, batches, saves, activate).
+# Serialize ALL trace operations (transactions, batches, activate).
 # Multiple threads (method executor, event worker, Ghidra refresh callbacks)
 # compete for the trace lock, causing "Unable to lock due to active transaction"
 # errors and snap mismatches.
@@ -154,7 +154,6 @@ def start_trace(host: str, port: int, registry):
     STATE.client = Client(c, 'vice-c64', registry)
     STATE.trace = STATE.client.create_trace('VICE C64', arch.LANGUAGE_ID,
                                             arch.COMPILER_SPEC, extra=None)
-    STATE.trace.save()
 
 
 def populate_initial_state():
@@ -196,9 +195,8 @@ def _end_batch_checked(client, where):
     ghidratrace's Batch._get_result catches BaseException and *returns* the exception object
     instead of raising, so end_batch() hands back a list that may contain exceptions. All three
     call sites here discarded it, which meant a failed queued operation -- an endTx among them --
-    left no trace in this process. The next statement was trace.save(), and if the transaction
-    had not actually closed Ghidra answered "Can't save during transaction", killing the agent
-    with no indication of the real cause.
+    left no trace in this process and made the next trace operation fail without exposing the
+    original cause.
 
     Note end_batch() returns None when the batch is nested and the refcount has not reached zero;
     only the outermost end_batch waits on the futures.
@@ -243,9 +241,6 @@ def _populate_initial_trace(
     finally:
         log.debug("populate_initial_state(): end_batch")
         _end_batch_checked(STATE.require_client(), "populate_initial_state")
-    log.debug("populate_initial_state(): save")
-    trace.save()
-
     # Disassemble and activate AFTER batch — Ghidra needs committed data first
     snap = trace.snap()
     log.debug(f"populate_initial_state(): current snap={snap}")
@@ -511,9 +506,6 @@ def on_stop(remaining_ms=_default_remaining_ms):
         finally:
             log.debug("on_stop(): end_batch")
             _end_batch_checked(client, "on_stop")
-        log.debug("on_stop(): save")
-        trace.save()
-
         # Disassemble and activate AFTER batch — Ghidra needs committed data first
         log.debug(f"on_stop(): disassemble at Address('RAM', 0x{pc:04X})")
         with trace.open_tx('Disassemble') as tx:
@@ -623,7 +615,6 @@ def sync_result(kind: str, result, remaining_ms):
         if kind == "snapshot_load":
             registers, _checkpoints, _memory = prepared
             pc = registers.get("PC", registers.get("pc", 0))
-            trace.save()
             with trace.open_tx("Disassemble"):
                 trace.disassemble(Address("RAM", pc))
             with trace.open_tx("Activate"):
