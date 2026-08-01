@@ -3,8 +3,8 @@
 #@desc <html><body width="300px">
 #@desc   <h3>Launch VICE and connect via Binary Monitor Protocol</h3>
 #@desc   <p>Starts the emulator with the binary monitor enabled (optionally
-#@desc   autostarting a PRG image), waits for the monitor port, then attaches
-#@desc   the connector.</p>
+#@desc   autostarting a PRG image), then attaches the connector, which waits
+#@desc   for the monitor port.</p>
 #@desc </body></html>
 #@menu-group vice
 #@icon icon.debugger
@@ -40,10 +40,9 @@ VENV_SITE="$("$OPT_PYTHON_EXE" -c 'import site; print(site.getsitepackages()[0])
 export PYTHONPATH="$pypathVice:$VENV_SITE:$pypathTrace:$PYTHONPATH"
 
 # VICE needs a scheme-qualified bind address. Handed a bare "HOST:PORT" it binds nothing
-# and reports no error at all (observed on VICE 3.10), so the port wait below spins for its
-# full 30 seconds and the launch fails with a timeout that blames the port rather than the
-# argument. VICE documents the ip4:// and ip6:// forms; only the bind address needs them —
-# the client-side connects below stay plain host and port.
+# and reports no error at all (observed on VICE 3.10), so the connector's readiness wait runs
+# for its full 30 seconds and the launch fails with a timeout that blames the port rather than
+# the argument. VICE documents the ip4:// and ip6:// forms; only the bind address needs them.
 case "$OPT_HOST" in
   *:*) monitor_bind="ip6://[$OPT_HOST]:$OPT_PORT" ;;
   *)   monitor_bind="ip4://$OPT_HOST:$OPT_PORT" ;;
@@ -68,19 +67,9 @@ fi
 VICE_PID=$!
 trap 'kill "$VICE_PID" 2>/dev/null' EXIT
 
-# Wait for the binary monitor port; bail out early if VICE dies during startup.
-deadline=$((SECONDS + 30))
-until (exec 3<>"/dev/tcp/$OPT_HOST/$OPT_PORT") 2>/dev/null; do
-  if ! kill -0 "$VICE_PID" 2>/dev/null; then
-    echo "[vice-c64-launch] VICE exited before opening the binary monitor port" >&2
-    exit 1
-  fi
-  if (( SECONDS >= deadline )); then
-    echo "[vice-c64-launch] binary monitor port $OPT_HOST:$OPT_PORT not open after 30s" >&2
-    exit 1
-  fi
-  sleep 0.5
-done
-exec 3<&- 3>&-
-
 "$OPT_PYTHON_EXE" "$EXT_ROOT/data/support/vice-c64.py"
+status=$?
+if [ "$status" -ne 0 ] && ! kill -0 "$VICE_PID" 2>/dev/null; then
+  echo "[vice-c64-launch] VICE is no longer running" >&2
+fi
+exit "$status"

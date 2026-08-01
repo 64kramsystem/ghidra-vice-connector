@@ -35,6 +35,10 @@ MAX_ABANDONED_REQUESTS = 4096
 # Once a response header declares a body, the reader must receive every byte
 # before it can recover framing.
 RESPONSE_BODY_IDLE_TIMEOUT_SECONDS = 5.0
+# The launcher cannot probe this single-client protocol without becoming a
+# client. Let the real client wait until VICE opens its listener.
+MONITOR_READY_TIMEOUT_SECONDS = 30.0
+MONITOR_READY_RETRY_SECONDS = 0.2
 
 CMD_MEMORY_GET = 0x01
 CMD_MEMORY_SET = 0x02
@@ -680,9 +684,7 @@ class ViceBmpClient:
                 # A record from an earlier session says nothing about the
                 # emulator we are about to talk to.
                 self._vice_info = None
-                self._sock = socket.create_connection(
-                    (self.host, self.port), timeout=10
-                )
+                self._sock = self._connect_when_ready()
                 self._sock.settimeout(None)
                 self._running = True
                 self._recv_thread = threading.Thread(
@@ -703,6 +705,17 @@ class ViceBmpClient:
             except BaseException:
                 self.disconnect()
                 raise
+
+    def _connect_when_ready(self) -> socket.socket:
+        """Retry refusals until VICE finishes opening its monitor listener."""
+        deadline = time.monotonic() + MONITOR_READY_TIMEOUT_SECONDS
+        while True:
+            try:
+                return socket.create_connection((self.host, self.port), timeout=10)
+            except ConnectionRefusedError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(MONITOR_READY_RETRY_SECONDS)
 
     def disconnect(self) -> None:
         self._terminate(ViceConnectionError("VICE monitor connection closed"))

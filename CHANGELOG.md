@@ -6,6 +6,10 @@
 
 - Added physical C64 keyboard-matrix press/release through the patched VICE binary monitor.
 
+### Fixed
+
+- The connector now waits for VICE's binary monitor itself; the launcher no longer opens and drops a throwaway monitor connection to probe it.
+
 ## 0.101.0
 ### Added
 
