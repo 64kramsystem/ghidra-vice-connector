@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added physical C64 keyboard-matrix press/release through the patched VICE binary monitor.
+- Added physical C64 keyboard-matrix press/release through the patched VICE binary monitor. A build without the command is reported as `vice_unsupported_build` instead of a bare command failure.
 
 ### Fixed
 

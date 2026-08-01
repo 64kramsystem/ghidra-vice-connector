@@ -32,6 +32,7 @@ from vice.protocol import (
     CPU_OP_EXEC,
     CPU_OP_LOAD,
     CPU_OP_STORE,
+    ERR_CMD_INVALID_TYPE,
     Frame,
     API_VERSION,
     RESP_HDR_FMT,
@@ -51,9 +52,11 @@ from vice.protocol import (
     RESP_SNAPSHOT_DUMP,
     RESP_SNAPSHOT_UNDUMP,
     ViceBmpClient,
+    ViceCommandError,
     ViceConnectionError,
     ViceProtocolError,
     ViceTimeoutError,
+    ViceUnsupportedBuildError,
     ViceValidationError,
     STX,
 )
@@ -340,6 +343,36 @@ def test_keyboard_joyport_resource_and_snapshot_wire_formats(connected_client):
     )
     assert seen["snapshot_save"] == b"\x01\x00\x09start.vsf"
     assert seen["snapshot_load"] == b"\x09start.vsf"
+
+
+def test_keyboard_matrix_on_a_build_without_the_command_is_an_unsupported_build(
+    connected_client,
+):
+    client, server = connected_client
+    # Stock VICE answers an unimplemented command with response type 0x00.
+    server.handle(
+        CMD_KEYBOARD_MATRIX_SET,
+        lambda _: (0x00, b"", ERR_CMD_INVALID_TYPE),
+    )
+
+    with pytest.raises(ViceUnsupportedBuildError) as caught:
+        client.keyboard_matrix_set(7, 4, True)
+
+    assert caught.value.code == "vice_unsupported_build"
+    assert "keyboard matrix" in str(caught.value)
+
+
+def test_keyboard_matrix_reports_any_other_error_as_a_command_failure(connected_client):
+    # Only "command type invalid" describes the build. Every other error is this call going
+    # wrong on a build that does implement it, and must not be relabelled as unsupported.
+    client, server = connected_client
+    server.handle(CMD_KEYBOARD_MATRIX_SET, lambda _: (0x00, b"", 0x8f))
+
+    with pytest.raises(ViceCommandError) as caught:
+        client.keyboard_matrix_set(7, 4, True)
+
+    assert not isinstance(caught.value, ViceUnsupportedBuildError)
+    assert caught.value.error == 0x8f
 
 
 def test_snapshot_save_marks_uncertain_timeout_as_mutating():

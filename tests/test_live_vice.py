@@ -39,9 +39,14 @@ def _vice_reachable():
 _VICE_UP = _vice_reachable()
 
 # CI boots an emulator and sets REQUIRE_LIVE_VICE so a VICE boot failure fails the suite
-# instead of silently skipping it.
-if os.environ.get('REQUIRE_LIVE_VICE') and not _VICE_UP:
-    pytest.fail(f"REQUIRE_LIVE_VICE is set but VICE is not reachable on {VICE_HOST}:{VICE_PORT}",
+# instead of silently skipping it. REQUIRE_KEYBOARD_MATRIX implies the same demand: asking for a
+# capability of the running build is meaningless if nothing is running.
+_STRICT = next(
+    (name for name in ("REQUIRE_LIVE_VICE", "REQUIRE_KEYBOARD_MATRIX") if os.environ.get(name)),
+    None,
+)
+if _STRICT and not _VICE_UP:
+    pytest.fail(f"{_STRICT} is set but VICE is not reachable on {VICE_HOST}:{VICE_PORT}",
                 pytrace=False)
 
 pytestmark = pytest.mark.skipif(
@@ -221,11 +226,33 @@ class TestLiveMemory:
         vice.memory_set(addr, original)
 
 
+def require_keyboard_matrix(vice):
+    """Skip unless this build implements the keyboard-matrix command.
+
+    Nothing can be checked in advance here: the release below *is* the probe,
+    harmless on both builds, because one without the command changes nothing
+    and answers "command type invalid".
+
+    REQUIRE_LIVE_VICE cannot stand in for the strict mode below: it asserts that
+    VICE is reachable, which a stock build also satisfies. Only a run that knows
+    it booted the patched build can demand the command, so that run sets
+    REQUIRE_KEYBOARD_MATRIX and a skip here becomes a failure -- otherwise a
+    dropped VICE patch, the wrong executable, or a changed command byte would
+    read as "stock build, nothing to test".
+    """
+    try:
+        vice.controller.set_keyboard_matrix(7, 4, False)
+    except ViceUnsupportedBuildError as refusal:
+        if os.environ.get("REQUIRE_KEYBOARD_MATRIX"):
+            pytest.fail(f"REQUIRE_KEYBOARD_MATRIX is set but {refusal}")
+        pytest.skip(str(refusal))
+
+
 class TestLiveKeyboardMatrix:
     def test_space_press_is_visible_through_cia1(self, vice):
+        require_keyboard_matrix(vice)
         original = vice.memory_get(0xDC00, 0xDC03, side_effects=True)
         try:
-            vice.controller.set_keyboard_matrix(7, 4, False)
             vice.memory_set(0xDC02, b'\xff', side_effects=True)
             vice.memory_set(0xDC03, b'\x00', side_effects=True)
             vice.memory_set(0xDC00, b'\x7f', side_effects=True)

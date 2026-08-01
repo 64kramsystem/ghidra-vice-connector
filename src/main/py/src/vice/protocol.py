@@ -93,6 +93,10 @@ RESP_KEYBOARD_MATRIX_SET = 0xA3
 RESP_EXIT = 0xAA
 RESP_RESET = 0xCC
 
+# `e_MON_ERR_CMD_INVALID_TYPE`, which VICE emits only from the fall-through
+# branch of its command dispatcher: the build does not implement the command.
+ERR_CMD_INVALID_TYPE = 0x83
+
 # `display get` format selector: 0x00 is the only one VICE implements, one
 # palette index per byte.
 DISPLAY_FORMAT_INDEXED8 = 0x00
@@ -176,12 +180,17 @@ class ViceValidationError(ViceFailure):
 
 
 class ViceUnsupportedBuildError(ViceFailure):
-    """The connected VICE build cannot be asked for this command.
+    """The connected VICE build cannot carry out this command.
 
     Distinct from :class:`ViceValidationError`, which would read as a caller
     mistake, and from :class:`ViceProtocolError`, which means VICE answered
-    something malformed. Here VICE answered perfectly well; the build it
-    described is one we refuse to send the command to.
+    something malformed. Here VICE behaved correctly; the build is simply the
+    wrong one to ask.
+
+    Raised for both shapes that judgement can take: refusing to send, when the
+    command would damage an affected build (`display get`), and classifying the
+    reply, when sending is harmless and the build answers that it does not
+    implement the command (keyboard matrix). Either way nothing was carried out.
     """
 
     code = "vice_unsupported_build"
@@ -1636,16 +1645,34 @@ class ViceBmpClient:
         *,
         timeout_ms: int = 10_000,
     ) -> None:
+        """Press or release one key in VICE's keyboard matrix.
+
+        The command is not in stock VICE. Unlike the `display get` guard there
+        is nothing to refuse in advance -- a build without it simply answers
+        "command type invalid" and does nothing -- so the build is judged by
+        that answer rather than by a revision number.
+        """
         _validate_id(row, "keyboard row", 15)
         _validate_id(column, "keyboard column", 7)
         _validate_bool(pressed, "pressed")
-        self.command(
-            CMD_KEYBOARD_MATRIX_SET,
-            bytes((row, column, int(pressed))),
-            expected=RESP_KEYBOARD_MATRIX_SET,
-            timeout_ms=timeout_ms,
-            mutating=True,
-        )
+        try:
+            self.command(
+                CMD_KEYBOARD_MATRIX_SET,
+                bytes((row, column, int(pressed))),
+                expected=RESP_KEYBOARD_MATRIX_SET,
+                timeout_ms=timeout_ms,
+                mutating=True,
+            )
+        except ViceCommandError as failure:
+            if failure.error != ERR_CMD_INVALID_TYPE:
+                raise
+            raise ViceUnsupportedBuildError(
+                "this VICE build does not implement the keyboard matrix "
+                f"command (0x{CMD_KEYBOARD_MATRIX_SET:02x}); the key was not "
+                "pressed or released",
+                command=CMD_KEYBOARD_MATRIX_SET,
+                request_id=failure.request_id,
+            ) from failure
 
     def resource_set_int(
         self, name: str, value: int, *, timeout_ms: int = 10_000
