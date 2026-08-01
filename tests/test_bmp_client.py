@@ -20,6 +20,7 @@ from vice.protocol import (
     CMD_CHECKPOINT_TOGGLE,
     CMD_JOYPORT_SET,
     CMD_KEYBOARD_FEED,
+    CMD_KEYBOARD_MATRIX_SET,
     CMD_MEMORY_GET,
     CMD_MEMORY_SET,
     CMD_REGISTERS_GET,
@@ -41,6 +42,7 @@ from vice.protocol import (
     RESP_CHECKPOINT_TOGGLE,
     RESP_JOYPORT_SET,
     RESP_KEYBOARD_FEED,
+    RESP_KEYBOARD_MATRIX_SET,
     RESP_MEMORY_GET,
     RESP_MEMORY_SET,
     RESP_REGISTERS_GET,
@@ -245,6 +247,10 @@ def test_keyboard_joyport_resource_and_snapshot_wire_formats(connected_client):
         CMD_KEYBOARD_FEED, handler("keyboard", RESP_KEYBOARD_FEED)
     )
     server.handle(CMD_JOYPORT_SET, handler("joyport", RESP_JOYPORT_SET))
+    server.handle(
+        CMD_KEYBOARD_MATRIX_SET,
+        handler("keyboard_matrix", RESP_KEYBOARD_MATRIX_SET),
+    )
     server.handle(CMD_RESOURCE_SET, handler("resource", RESP_RESOURCE_SET))
     server.handle(
         CMD_SNAPSHOT_DUMP, handler("snapshot_save", RESP_SNAPSHOT_DUMP)
@@ -260,12 +266,14 @@ def test_keyboard_joyport_resource_and_snapshot_wire_formats(connected_client):
 
     client.keyboard_feed(b"GO")
     client.joyport_set(2, 0xEF)
+    client.keyboard_matrix_set(7, 4, True)
     client.resource_set_int("JoyPort2Device", 37)
     client.snapshot_save("start.vsf", save_roms=True, save_disks=False)
     assert client.snapshot_load("start.vsf") == 0xC123
 
     assert seen["keyboard"] == b"\x02GO"
     assert seen["joyport"] == struct.pack("<HH", 1, 0xEF)
+    assert seen["keyboard_matrix"] == b"\x07\x04\x01"
     assert seen["resource"] == (
         b"\x01\x0eJoyPort2Device\x04"
         + (37).to_bytes(4, "little", signed=True)

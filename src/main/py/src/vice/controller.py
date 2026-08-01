@@ -744,6 +744,37 @@ class ViceController:
 
         return self._stopped_call(configure, timeout_ms=timeout_ms)
 
+    def set_keyboard_matrix(
+        self,
+        row: int,
+        column: int,
+        pressed: bool,
+        *,
+        timeout_ms: int = 10_000,
+    ) -> Tuple[int, Dict[str, object]]:
+        if (
+            isinstance(row, bool)
+            or not isinstance(row, int)
+            or not 0 <= row <= 7
+        ):
+            raise ViceValidationError("row must be in 0..7")
+        if (
+            isinstance(column, bool)
+            or not isinstance(column, int)
+            or not 0 <= column <= 7
+        ):
+            raise ViceValidationError("column must be in 0..7")
+        if not isinstance(pressed, bool):
+            raise ViceValidationError("pressed must be boolean")
+
+        def configure(remaining):
+            self.client.keyboard_matrix_set(
+                row, column, pressed, timeout_ms=remaining()
+            )
+            return {"row": row, "column": column, "pressed": pressed}
+
+        return self._stopped_call(configure, timeout_ms=timeout_ms)
+
     def save_snapshot(
         self,
         filename: str,

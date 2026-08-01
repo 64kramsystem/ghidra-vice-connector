@@ -58,6 +58,7 @@ CMD_DISPLAY_GET = 0x84
 CMD_VICE_INFO = 0x85
 CMD_PALETTE_GET = 0x91
 CMD_JOYPORT_SET = 0xA2
+CMD_KEYBOARD_MATRIX_SET = 0xA3
 CMD_EXIT = 0xAA
 CMD_QUIT = 0xBB
 CMD_RESET = 0xCC
@@ -84,6 +85,7 @@ RESP_DISPLAY_GET = 0x84
 RESP_VICE_INFO = 0x85
 RESP_PALETTE_GET = 0x91
 RESP_JOYPORT_SET = 0xA2
+RESP_KEYBOARD_MATRIX_SET = 0xA3
 RESP_EXIT = 0xAA
 RESP_RESET = 0xCC
 
@@ -1609,6 +1611,25 @@ class ViceBmpClient:
             # Printed C64 ports are 1/2; VICE's binary-monitor enum is 0/1.
             struct.pack("<HH", port - 1, value),
             expected=RESP_JOYPORT_SET,
+            timeout_ms=timeout_ms,
+            mutating=True,
+        )
+
+    def keyboard_matrix_set(
+        self,
+        row: int,
+        column: int,
+        pressed: bool,
+        *,
+        timeout_ms: int = 10_000,
+    ) -> None:
+        _validate_id(row, "keyboard row", 15)
+        _validate_id(column, "keyboard column", 7)
+        _validate_bool(pressed, "pressed")
+        self.command(
+            CMD_KEYBOARD_MATRIX_SET,
+            bytes((row, column, int(pressed))),
+            expected=RESP_KEYBOARD_MATRIX_SET,
             timeout_ms=timeout_ms,
             mutating=True,
         )

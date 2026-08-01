@@ -545,6 +545,23 @@ def set_joyport(
     )
 
 
+@REGISTRY.method(name="c64_vice_v1_set_keyboard_matrix")
+def set_keyboard_matrix(
+    process: C64,
+    row: int,
+    column: int,
+    pressed: bool,
+    timeout_ms: int = 10_000,
+) -> str:
+    return _call(
+        process,
+        "set_keyboard_matrix",
+        lambda controller: controller.set_keyboard_matrix(
+            row, column, pressed, timeout_ms=timeout_ms
+        ),
+    )
+
+
 @REGISTRY.method(name="c64_vice_v1_save_snapshot")
 def save_snapshot(
     process: C64,
