@@ -23,6 +23,8 @@ The controller serializes monitor commands and publishes VICE stop/resume events
 
 Display capture needs a VICE build containing the safe display-command fix (revision r46020 or later, or release 3.11 or later).
 
+Physical keyboard-matrix input needs a VICE build containing binary-monitor command `0xa3` from the companion patch; stock builds reject it cleanly.
+
 ## Build and install
 
 ```sh

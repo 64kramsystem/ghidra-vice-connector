@@ -123,11 +123,18 @@ def test_status_reports_the_declared_connector_version(controller):
 def test_input_and_snapshot_envelopes_forward_exact_arguments(controller):
     controller.feed_keyboard.return_value = (8, None)
     controller.set_joyport.return_value = (9, {"port": 2, "value": 0xEF})
-    controller.save_snapshot.return_value = (10, None)
-    controller.load_snapshot.return_value = (11, 0xC123)
+    controller.set_keyboard_matrix.return_value = (
+        10,
+        {"row": 7, "column": 4, "pressed": True},
+    )
+    controller.save_snapshot.return_value = (11, None)
+    controller.load_snapshot.return_value = (12, 0xC123)
 
     fed = payload(automation.feed_keyboard(process(), b"GO", 1000))
     joy = payload(automation.set_joyport(process(), 2, 0xEF, 1000))
+    matrix = payload(
+        automation.set_keyboard_matrix(process(), 7, 4, True, 1000)
+    )
     saved = payload(
         automation.save_snapshot(process(), "start.vsf", True, False, 1000)
     )
@@ -135,10 +142,14 @@ def test_input_and_snapshot_envelopes_forward_exact_arguments(controller):
 
     assert fed["result"] == {"byte_count": 2}
     assert joy["result"] == {"port": 2, "value": 0xEF}
+    assert matrix["result"] == {"row": 7, "column": 4, "pressed": True}
     assert saved["result"] == {"filename": "start.vsf"}
     assert loaded["result"]["pc"] == 0xC123
     controller.feed_keyboard.assert_called_once_with(b"GO", timeout_ms=1000)
     controller.set_joyport.assert_called_once_with(2, 0xEF, timeout_ms=1000)
+    controller.set_keyboard_matrix.assert_called_once_with(
+        7, 4, True, timeout_ms=1000
+    )
     controller.save_snapshot.assert_called_once_with(
         "start.vsf", save_roms=True, save_disks=False, timeout_ms=1000
     )

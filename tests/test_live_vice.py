@@ -221,6 +221,32 @@ class TestLiveMemory:
         vice.memory_set(addr, original)
 
 
+class TestLiveKeyboardMatrix:
+    def test_space_press_is_visible_through_cia1(self, vice):
+        original = vice.memory_get(0xDC00, 0xDC03, side_effects=True)
+        try:
+            vice.controller.set_keyboard_matrix(7, 4, False)
+            vice.memory_set(0xDC02, b'\xff', side_effects=True)
+            vice.memory_set(0xDC03, b'\x00', side_effects=True)
+            vice.memory_set(0xDC00, b'\x7f', side_effects=True)
+            released = vice.memory_get(
+                0xDC01, 0xDC01, side_effects=True
+            )[0]
+
+            vice.controller.set_keyboard_matrix(7, 4, True)
+            pressed = vice.memory_get(
+                0xDC01, 0xDC01, side_effects=True
+            )[0]
+
+            assert released & 0x10
+            assert pressed & 0x10 == 0
+        finally:
+            vice.controller.set_keyboard_matrix(7, 4, False)
+            vice.memory_set(0xDC00, original[0:1], side_effects=True)
+            vice.memory_set(0xDC02, original[2:3], side_effects=True)
+            vice.memory_set(0xDC03, original[3:4], side_effects=True)
+
+
 # ── Checkpoints (breakpoints / watchpoints) ──────────────────────────────────
 
 class TestLiveCheckpoints:

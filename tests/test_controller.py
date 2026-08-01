@@ -126,6 +126,28 @@ def test_pending_event_is_drained_before_precondition():
     controller.close()
 
 
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ((8, 0, True), "row"),
+        ((0, 8, True), "column"),
+        ((0, 0, 1), "pressed"),
+    ],
+)
+def test_keyboard_matrix_validates_before_stopped_check(arguments, message):
+    client, controller = connected_controller()
+    with controller._condition:
+        controller._execution_state = "running"
+    before = controller.command_sequence
+
+    with pytest.raises(ViceValidationError, match=message):
+        controller.set_keyboard_matrix(*arguments)
+
+    assert controller.command_sequence == before
+    assert client.calls == []
+    controller.close()
+
+
 def test_wait_for_stop_is_passive_and_returns_latest_stop():
     client, controller = connected_controller()
     result = {}
