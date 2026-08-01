@@ -3,6 +3,7 @@
 import struct
 import socket
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -78,10 +79,69 @@ def test_connect_discovers_register_metadata(connected_client):
     assert client.reg_name_to_bits["PC"] == 16
 
 
-def test_connect_failure_is_structured():
-    client = ViceBmpClient("127.0.0.1", 19999)
+def test_connect_gives_up_on_a_never_opened_port(monkeypatch):
+    monkeypatch.setattr("vice.protocol.MONITOR_READY_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr("vice.protocol.MONITOR_READY_RETRY_SECONDS", 0.01)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    client = ViceBmpClient("127.0.0.1", port)
+    started = time.monotonic()
     with pytest.raises(ViceConnectionError):
         client.connect()
+    assert time.monotonic() - started < 5
+
+
+def test_connect_waits_for_a_late_monitor_listener(monkeypatch):
+    monkeypatch.setattr("vice.protocol.MONITOR_READY_RETRY_SECONDS", 0.01)
+    server = MockViceServer()
+    timer = threading.Timer(0.2, server.start)
+    timer.start()
+    client = ViceBmpClient("127.0.0.1", server.port)
+    try:
+        client.connect()
+        assert client.ping()
+    finally:
+        client.disconnect()
+        timer.cancel()
+        server.stop()
+
+
+def test_connect_does_not_retry_after_the_monitor_accepts(monkeypatch):
+    monkeypatch.setattr("vice.protocol.MONITOR_READY_RETRY_SECONDS", 0.01)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(2)
+    listener.settimeout(0.1)
+    accepted = []
+    stopped = threading.Event()
+
+    def accept_and_close():
+        while not stopped.is_set():
+            try:
+                connection, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            accepted.append(connection)
+            connection.close()
+
+    thread = threading.Thread(target=accept_and_close, daemon=True)
+    thread.start()
+    client = ViceBmpClient("127.0.0.1", listener.getsockname()[1])
+    try:
+        with pytest.raises(ViceConnectionError):
+            client.connect()
+        thread.join(1)
+        time.sleep(0.1)
+        assert len(accepted) == 1
+    finally:
+        client.disconnect()
+        stopped.set()
+        listener.close()
+        thread.join(1)
 
 
 def test_register_get_and_set_roundtrip_frames(connected_client):
