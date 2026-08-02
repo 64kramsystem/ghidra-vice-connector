@@ -4,7 +4,7 @@ API = "c64.vice/1"
 API_MAJOR = 1
 METHOD_NAMESPACE = "c64_vice_v1_"
 CONNECTOR_NAME = "ghidra-vice-connector"
-CONNECTOR_VERSION = "0.101.0"
+CONNECTOR_VERSION = "0.102.0"
 
 LIMITS = {
     "keyboard_feed_bytes": 255,
