@@ -33,6 +33,9 @@ GHIDRA_INSTALL_DIR=/path/to/ghidra_12.1_PUBLIC \
 ./gradlew buildExtension
 ```
 
+The wrapper enables Java native access and Gradle's configuration cache by default.
+Pass `--no-configuration-cache` to disable the cache for a build.
+
 Install the zip from `dist/` through Ghidra's **File > Install Extensions**, then restart Ghidra.
 
 ## Use

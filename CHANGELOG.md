@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Enable Java native access and configuration caching for extension builds, with a cache-safe dependency-copy task.
+
 ## 0.102.1
 ### Changed
 

@@ -13,9 +13,11 @@ CLASSPATH="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
 
 exec "$JAVACMD" \
   -Xmx64m -Xms64m \
+  --enable-native-access=ALL-UNNAMED \
   $JAVA_OPTS \
   $GRADLE_OPTS \
   "-Dorg.gradle.appname=gradlew" \
   -classpath "$CLASSPATH" \
   org.gradle.wrapper.GradleWrapperMain \
+  --configuration-cache \
   "$@"

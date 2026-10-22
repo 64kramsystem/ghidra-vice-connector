@@ -14,6 +14,25 @@ if (ghidraInstallDir) {
     throw new GradleException("GHIDRA_INSTALL_DIR is not defined!")
 }
 
+// Ghidra's dependency-copy filter accesses Project at execution time. Capture the
+// directories during configuration so the same exclusions work with the cache.
+def ghidraHome = file(ghidraInstallDir).canonicalFile
+def dependencyDir = file('lib').canonicalFile
+def copyExtensionDependencies = tasks.register('copyExtensionDependencies', Copy) {
+    group = 'Ghidra Private'
+    from configurations.runtimeClasspath
+    into dependencyDir
+    exclude { entry ->
+        def path = entry.file.canonicalFile.toPath()
+        path.startsWith(ghidraHome.toPath()) || path.startsWith(dependencyDir.toPath())
+    }
+}
+def inheritedCopyDependencies = tasks.named('copyDependencies').get()
+tasks.named('compileJava') {
+    setDependsOn(dependsOn.findAll { it != inheritedCopyDependencies })
+    dependsOn copyExtensionDependencies
+}
+
 repositories {
     mavenCentral()
 }
