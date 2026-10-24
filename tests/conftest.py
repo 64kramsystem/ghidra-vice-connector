@@ -55,15 +55,16 @@ def _build_ghidratrace_stubs():
             return f"Address({self.space!r}, 0x{self.offset:04X})"
 
     class _AddressRange:
-        def __init__(self, start: '_Address', length: int):
-            self.min = start
-            self.max = _Address(start.space, start.offset + length - 1)
+        def __init__(self, space: str, min: int, max: int):
+            self.space = space
+            self.min = min
+            self.max = max
         def __repr__(self):
-            return f"AddressRange({self.min!r}, len={self.max.offset - self.min.offset + 1})"
+            return f"AddressRange({self.space!r}, {self.min}, {self.max})"
 
         @classmethod
         def extend(cls, start: '_Address', length: int) -> '_AddressRange':
-            return cls(start, length)
+            return cls(start.space, start.offset, start.offset + length - 1)
 
     # MethodRegistry: collect decorated methods without needing a real executor
     class _MethodRegistry:

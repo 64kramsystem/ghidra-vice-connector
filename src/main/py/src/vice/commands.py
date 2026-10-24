@@ -433,14 +433,9 @@ def put_memory_bytes(start: int, length: int = 256):
 # ── Breakpoint population ─────────────────────────────────────────────────────
 
 def _cpu_op_to_kinds(cpu_op: int) -> str:
-    parts = []
-    if cpu_op & CPU_OP_EXEC:
-        parts.append('SW_EXECUTE')
-    if cpu_op & CPU_OP_LOAD:
-        parts.append('READ')
-    if cpu_op & CPU_OP_STORE:
-        parts.append('WRITE')
-    return ','.join(parts) if parts else 'UNKNOWN'
+    return ''.join(flag for bit, flag in (
+        (CPU_OP_LOAD, 'R'), (CPU_OP_STORE, 'W'), (CPU_OP_EXEC, 'x')
+    ) if cpu_op & bit)
 
 
 def put_breakpoints():

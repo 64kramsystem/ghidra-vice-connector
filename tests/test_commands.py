@@ -187,30 +187,30 @@ class TestPutBreakpoints:
 class TestCpuOpToKinds:
     def test_exec(self):
         result = commands._cpu_op_to_kinds(CPU_OP_EXEC)
-        assert 'SW_EXECUTE' in result
+        assert 'x' in result
 
     def test_load(self):
         result = commands._cpu_op_to_kinds(CPU_OP_LOAD)
-        assert 'READ' in result
+        assert 'R' in result
 
     def test_store(self):
         result = commands._cpu_op_to_kinds(CPU_OP_STORE)
-        assert 'WRITE' in result
+        assert 'W' in result
 
     def test_combined_load_store(self):
         result = commands._cpu_op_to_kinds(CPU_OP_LOAD | CPU_OP_STORE)
-        assert 'READ'  in result
-        assert 'WRITE' in result
+        assert 'R'  in result
+        assert 'W' in result
 
     def test_unknown_op(self):
         result = commands._cpu_op_to_kinds(0x00)
-        assert result == 'UNKNOWN'
+        assert result == ''
 
     def test_all_three(self):
         result = commands._cpu_op_to_kinds(CPU_OP_EXEC | CPU_OP_LOAD | CPU_OP_STORE)
-        assert 'SW_EXECUTE' in result
-        assert 'READ'        in result
-        assert 'WRITE'       in result
+        assert 'x' in result
+        assert 'R'        in result
+        assert 'W'       in result
 
 
 # ── on_stop / on_resume ────────────────────────────────────────────────────────
@@ -404,14 +404,14 @@ class TestCpuOpToKindsExhaustive:
         for cpu_op in range(1, 8):  # 1 through 7 (all non-zero combos of 3 bits)
             result = commands._cpu_op_to_kinds(cpu_op)
             if cpu_op & 0x04:
-                assert 'SW_EXECUTE' in result
+                assert 'x' in result
             else:
-                assert 'SW_EXECUTE' not in result
+                assert 'x' not in result
             if cpu_op & 0x01:
-                assert 'READ' in result
+                assert 'R' in result
             else:
-                assert 'READ' not in result
+                assert 'R' not in result
             if cpu_op & 0x02:
-                assert 'WRITE' in result
+                assert 'W' in result
             else:
-                assert 'WRITE' not in result
+                assert 'W' not in result

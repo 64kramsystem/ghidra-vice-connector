@@ -1,0 +1,64 @@
+<context>
+    <schema name="Session" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="EventScope" />
+        <interface name="FocusScope" />
+        <interface name="Aggregate" />
+        <attribute name="C64" schema="C64" required="yes" fixed="yes" />
+        <attribute name="_event_thread" schema="OBJECT" hidden="yes" />
+        <attribute name="_focus" schema="OBJECT" hidden="yes" />
+        <attribute schema="VOID" />
+    </schema>
+    <schema name="C64" canonical="yes" elementResync="NEVER" attributeResync="ONCE" inherit="Process" remove-attribute="Modules">
+        <attribute name="Environment" schema="Environment" required="yes" fixed="yes" />
+        <attribute name="Threads" schema="ThreadContainer" required="yes" fixed="yes" />
+        <attribute name="Memory" schema="MemoryContainer" required="yes" fixed="yes" />
+        <attribute name="Breakpoints" schema="BreakpointContainer" required="yes" fixed="yes" />
+    </schema>
+    <schema name="Environment" elementResync="NEVER" attributeResync="NEVER" inherit="Environment">
+        <element schema="VOID" />
+        <attribute name="Banks" schema="BankContainer" required="yes" fixed="yes" />
+        <attribute schema="VOID" />
+    </schema>
+    <schema name="BankContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Aggregate" />
+        <element schema="ViceBank" />
+    </schema>
+    <schema name="ViceBank" elementResync="NEVER" attributeResync="NEVER">
+        <attribute name="_display" schema="STRING" />
+        <attribute name="id" schema="INT" />
+        <attribute schema="VOID" />
+    </schema>
+    <schema name="ThreadContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Aggregate" />
+        <element schema="C64Thread" />
+    </schema>
+    <schema name="C64Thread" canonical="yes" elementResync="NEVER" attributeResync="ONCE" inherit="Thread">
+        <attribute name="Stack" schema="StackContainer" required="yes" fixed="yes" />
+    </schema>
+    <schema name="StackContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE">
+        <interface name="Stack" />
+        <interface name="Aggregate" />
+        <element schema="C64Frame" />
+    </schema>
+    <schema name="C64Frame" canonical="yes" elementResync="NEVER" attributeResync="ONCE" inherit="StackFrame">
+        <attribute name="Registers" schema="RegisterContainer" required="yes" fixed="yes" />
+        <attribute name="PC" schema="ADDRESS" required="yes" />
+        <attribute-alias from="_pc" to="PC" />
+    </schema>
+    <schema name="RegisterContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE" inherit="RegisterValueContainer">
+        <element schema="Register" />
+    </schema>
+    <schema name="Register" elementResync="NEVER" attributeResync="NEVER" inherit="Register">
+        <attribute name="value" schema="INT" />
+    </schema>
+    <schema name="MemoryContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE" inherit="Memory">
+        <element schema="MemoryRegion" />
+    </schema>
+    <schema name="MemoryRegion" elementResync="NEVER" attributeResync="NEVER" inherit="MemoryRegion">
+        </schema>
+    <schema name="BreakpointContainer" canonical="yes" elementResync="NEVER" attributeResync="ONCE" inherit="BreakpointContainer">
+        <element schema="ViceBreakpoint" />
+    </schema>
+    <schema name="ViceBreakpoint" elementResync="NEVER" attributeResync="NEVER" inherit="BreakpointSpec">
+        </schema>
+</context>

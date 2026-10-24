@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- **Breaking:** require Ghidra 12.2 and JDK 25; build CI artifacts for that exact release.
+- Load only the selected Ghidra installation's 12.2 TraceRMI client; both launchers share setup and fail on a mismatched client.
+- Generate the object schema from Ghidra 12.2's shared fragments and encode breakpoint kinds as `x`, `R`, `W`, and `RW`.
+
+### Fixed
+
+- Use the Ghidra 12.2 integer AddressRange endpoints in watchpoint and memory-read actions; correct the test stub that concealed the mismatch.
+
+### Added
+
+- Native TraceRMI access-watchpoint action.
+
+
 ### Fixed
 
 - Enable Java native access and configuration caching for extension builds, with a cache-safe dependency-copy task.

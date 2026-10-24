@@ -8,7 +8,16 @@ if (System.env.GHIDRA_INSTALL_DIR) {
     ghidraInstallDir = project.getProperty("GHIDRA_INSTALL_DIR")
 }
 
+if (JavaVersion.current() != JavaVersion.VERSION_25) {
+    throw new GradleException("Build this extension with JDK 25.")
+}
+
 if (ghidraInstallDir) {
+    def metadata = new Properties()
+    file("${ghidraInstallDir}/Ghidra/application.properties").withInputStream { metadata.load(it) }
+    if (metadata.getProperty('application.version') != '12.2') {
+        throw new GradleException("This extension requires Ghidra 12.2.")
+    }
     apply from: new File(ghidraInstallDir).getCanonicalPath() + "/support/buildExtension.gradle"
 } else {
     throw new GradleException("GHIDRA_INSTALL_DIR is not defined!")
@@ -55,6 +64,17 @@ def connectorVersion = {
     return match.group(1)
 }()
 
+def schemaOutput = layout.buildDirectory.file('generated/vice/schema.xml')
+def buildSchema = tasks.register('buildSchema', Exec) {
+    inputs.file('src/main/py/src/vice/schema-base.xml')
+    inputs.file('tools/build_schema.py')
+    inputs.dir("${ghidraInstallDir}/Ghidra/Debug/Debugger-rmi-trace/pypkg/src/ghidratrace/xml")
+    outputs.file(schemaOutput)
+    doFirst { schemaOutput.get().asFile.parentFile.mkdirs() }
+    commandLine 'python3', 'tools/build_schema.py', ghidraInstallDir,
+        '--output', schemaOutput.get().asFile.absolutePath
+}
+
 // Preserve executable bit on shell launcher scripts in the zip.
 // Exclude Python bytecode, test artifacts, and dev files from the extension zip.
 tasks.named('buildExtension') {
@@ -72,11 +92,19 @@ tasks.named('buildExtension') {
     exclude 'test/**'
     exclude 'test_vice.py'
     exclude 'pytest.ini'
+    exclude 'AGENTS.md'
+    exclude 'tools/**'
+    exclude '**/schema-base.xml'
     exclude 'data/ghidra-project/**'
     exclude 'data/test_raw.bin'
 
     // Include Python agent source (buildExtension.gradle excludes src/** by default)
+    dependsOn buildSchema
+    from(schemaOutput) {
+        into "${project.name}/src/main/py/src/vice"
+    }
     from('src/main/py/src') {
+        exclude 'vice/schema.xml'
         into "${project.name}/src/main/py/src"
     }
 

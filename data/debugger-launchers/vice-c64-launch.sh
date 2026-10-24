@@ -28,16 +28,8 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# ghidra-module-pypath resolves installed (pypkg/src) and dev (build/pypkg/src) layouts. The VICE
-# package keeps its own path: this extension does not use the pypkg layout.
-pypathTrace=$(ghidra-module-pypath "Debugger-rmi-trace")
-pypathVice="$EXT_ROOT/src/main/py/src"
+. "$EXT_ROOT/data/support/prepare-python.sh" || exit $?
 
-# Discover the Python site-packages path so pip-installed ghidratrace (which
-# ships with protobuf) is found ahead of the Ghidra source copy.
-VENV_SITE="$("$OPT_PYTHON_EXE" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
-
-export PYTHONPATH="$pypathVice:$VENV_SITE:$pypathTrace:$PYTHONPATH"
 
 # VICE needs a scheme-qualified bind address. Handed a bare "HOST:PORT" it binds nothing
 # and reports no error at all (observed on VICE 3.10), so the connector's readiness wait runs
@@ -51,9 +43,8 @@ vice_args=(-binarymonitor -binarymonitoraddress "$monitor_bind")
 # Zero final output gain while leaving SID emulation and monitor-visible register
 # state active. Placed before OPT_EXTRA_VICE_ARGS: VICE takes
 # the last of a repeated resource option, so a caller can override the volume
-# there. Defaulted here as well as in the metadata, so a saved launch config from
-# before this option existed still starts muted rather than silently audible.
-if [ "${OPT_MUTE_AUDIO:-true}" = "true" ]; then
+# there.
+if [ "$OPT_MUTE_AUDIO" = "true" ]; then
   vice_args+=(-soundvolume 0)
 fi
 if [ -n "$OPT_EXTRA_VICE_ARGS" ]; then

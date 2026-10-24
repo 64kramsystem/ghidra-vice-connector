@@ -13,7 +13,7 @@ def address(offset):
 
 def address_range(start, end):
     from ghidratrace.client import Address, AddressRange
-    return AddressRange(Address("RAM", start), end - start + 1)
+    return AddressRange("RAM", start, end)
 
 
 @pytest.fixture

@@ -1,6 +1,6 @@
 # Ghidra VICE Connector
 
-A Ghidra 12.1 debugger extension for the Commodore 64. It connects one Ghidra TraceRMI session to one VICE binary-monitor socket and exposes the same controller to Ghidra's debugger UI and MCP automation.
+A Ghidra 12.2 debugger extension for the Commodore 64. It connects one Ghidra TraceRMI session to one VICE binary-monitor socket and exposes the same controller to Ghidra's debugger UI and MCP automation.
 
 ## What it supports
 
@@ -16,8 +16,8 @@ The controller serializes monitor commands and publishes VICE stop/resume events
 
 ## Requirements
 
-- Ghidra 12.1
-- JDK 21 for building
+- Ghidra 12.2
+- JDK 25 for building
 - Python 3 with Ghidra's `ghidratrace` package
 - VICE with the binary monitor enabled
 
@@ -28,8 +28,8 @@ Physical keyboard-matrix input needs a VICE build containing binary-monitor comm
 ## Build and install
 
 ```sh
-JAVA_HOME=/path/to/jdk-21 \
-GHIDRA_INSTALL_DIR=/path/to/ghidra_12.1_PUBLIC \
+JAVA_HOME=/path/to/jdk-25 \
+GHIDRA_INSTALL_DIR=/path/to/ghidra_12.2_PUBLIC \
 ./gradlew buildExtension
 ```
 
@@ -70,3 +70,14 @@ The implementation is under `src/main/py/src/vice/`:
 - `automation.py` exposes the MCP-facing TraceRMI methods.
 
 Apache-2.0. `NOTICE` records the original project and relicensing.
+
+Saved debugger traces from earlier Ghidra versions cannot be opened by 12.2; capture a new trace.
+
+The launchers load `ghidratrace` from the selected Ghidra installation, never from
+an older pip installation. Install `protobuf>=6.31.0` in the configured Python.
+The build composes `schema-base.xml` with Ghidra's 12.2 schema fragments; do not
+edit the generated `schema.xml`.
+
+For the full C64 MCP/TraceRMI integration test, use
+`ghidra-mcp-next/tools/test_debugger_stacks.py --stack vice --ghidra "$GHIDRA_INSTALL_DIR"`
+with sibling checkouts and a disposable VICE executable.

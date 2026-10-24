@@ -116,7 +116,7 @@ def set_watchpoint_read(process: C64,
                         range: Annotated[AddressRange, ParamDesc(display='Range')]):
     """Set a read watchpoint on an address range."""
     commands.STATE.require_controller().set_checkpoint(
-        range.min.offset, range.max.offset, cpu_op=CPU_OP_LOAD
+        range.min, range.max, cpu_op=CPU_OP_LOAD
     )
 
 
@@ -125,7 +125,16 @@ def set_watchpoint_write(process: C64,
                          range: Annotated[AddressRange, ParamDesc(display='Range')]):
     """Set a write watchpoint on an address range."""
     commands.STATE.require_controller().set_checkpoint(
-        range.min.offset, range.max.offset, cpu_op=CPU_OP_STORE
+        range.min, range.max, cpu_op=CPU_OP_STORE
+    )
+
+
+@REGISTRY.method(action='break_access', display='Set Access Watchpoint')
+def set_watchpoint_access(process: C64,
+                          range: Annotated[AddressRange, ParamDesc(display='Range')]):
+    """Stop on reads or writes within an address range."""
+    commands.STATE.require_controller().set_checkpoint(
+        range.min, range.max, cpu_op=CPU_OP_LOAD | CPU_OP_STORE
     )
 
 
@@ -150,9 +159,9 @@ def toggle_breakpoint(breakpoint: ViceBreakpoint,
 def read_memory(process: C64,
                 range: Annotated[AddressRange, ParamDesc(display='Range')]):
     """Refresh a specific memory range from VICE."""
-    start  = range.min.offset
+    start  = range.min
     commands.STATE.require_controller().read_memory(
-        start, range.max.offset, sync_trace=True
+        start, range.max, sync_trace=True
     )
 
 
