@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+## 0.103.0
 ### Changed
 
 - **Breaking:** require Ghidra 12.2 and JDK 25; build CI artifacts for that exact release.
