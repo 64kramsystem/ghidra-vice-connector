@@ -23,3 +23,6 @@ __pycache__/
 Thumbs.db
 data/test_raw.bin
 data/ghidra-project/
+
+AGENTS*.md
+!AGENTS.md
