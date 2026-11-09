@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+## 0.104.0
 ### Added
 
 - TraceRMI methods to start and stop native VICE monitor logging for address ranges.
