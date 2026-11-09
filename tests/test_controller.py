@@ -346,3 +346,165 @@ def test_pre_send_budget_exhaustion_has_no_mutation_risk():
 
     assert caught.value.outcome_unknown is True
     assert caught.value.state_may_have_changed is False
+
+
+def test_trace_partial_start_retains_known_checkpoints_for_stop(tmp_path):
+    client, controller = connected_controller()
+    client.resource_get = MagicMock(side_effect=[0, '/tmp/old.log'])
+    cp = MagicMock(number=12)
+    client.checkpoint_set = MagicMock(side_effect=[cp, ViceTimeoutError('timeout')])
+    client.checkpoint_list = MagicMock(return_value=[cp])
+    client.checkpoint_delete = MagicMock()
+    client.resource_set_string = MagicMock()
+    client.resource_set_int = MagicMock()
+    try:
+        with pytest.raises(ViceTimeoutError) as caught:
+            controller.start_trace([(1, 2), (3, 4)], 7, str(tmp_path / 'trace.log'))
+        trace_id = caught.value.trace_id
+        assert caught.value.checkpoint_ids == [12]
+        with pytest.raises(ViceValidationError) as partial:
+            controller.stop_trace(trace_id)
+        assert partial.value.checkpoint_ids == []
+        client.checkpoint_delete.assert_called_once_with(12, timeout_ms=pytest.approx(client.checkpoint_delete.call_args.kwargs['timeout_ms']))
+        assert controller._native_trace['unknown_checkpoint']
+    finally:
+        controller.close()
+
+
+def test_trace_stop_retries_only_remaining_owned_checkpoints(tmp_path):
+    client, controller = connected_controller()
+    client.resource_get = MagicMock(side_effect=[0, '/tmp/old.log'])
+    cp1, cp2 = MagicMock(number=12), MagicMock(number=13)
+    client.checkpoint_set = MagicMock(side_effect=[cp1, cp2])
+    client.checkpoint_list = MagicMock(side_effect=[[cp1, cp2], [cp2]])
+    client.checkpoint_delete = MagicMock(side_effect=[None, ViceValidationError('rejected'), None])
+    client.resource_set_string = MagicMock()
+    client.resource_set_int = MagicMock()
+    try:
+        _, trace = controller.start_trace([(1, 2), (3, 4)], 7, str(tmp_path / 'trace.log'))
+        with pytest.raises(ViceValidationError) as caught:
+            controller.stop_trace(trace['trace_id'])
+        assert caught.value.checkpoint_ids == [13]
+        controller.stop_trace(trace['trace_id'])
+        assert [call.args[0] for call in client.checkpoint_delete.call_args_list] == [12, 13, 13]
+        assert client.resource_set_string.call_args.args == ('MonitorLogFileName', '/tmp/old.log')
+    finally:
+        controller.close()
+
+
+def test_trace_stop_does_not_delete_reused_checkpoint_id(tmp_path):
+    client, controller = connected_controller()
+    original = MagicMock(number=12, start=1, end=2, stop_on_hit=False, enabled=True,
+                         cpu_op=7, temporary=False, memspace=0)
+    replacement = MagicMock(number=12, start=3, end=4, stop_on_hit=True, enabled=True,
+                            cpu_op=4, temporary=False, memspace=0)
+    client.resource_get = MagicMock(side_effect=[0, '/tmp/old.log'])
+    client.resource_set_string = MagicMock()
+    client.resource_set_int = MagicMock()
+    client.checkpoint_set = MagicMock(return_value=original)
+    client.checkpoint_list = MagicMock(return_value=[replacement])
+    client.checkpoint_delete = MagicMock()
+    try:
+        _, trace = controller.start_trace([(1, 2)], 7, str(tmp_path / 'trace.log'))
+        controller.stop_trace(trace['trace_id'])
+        client.checkpoint_delete.assert_not_called()
+    finally:
+        controller.close()
+
+
+def test_public_delete_timeout_keeps_unresolved_owned_checkpoint(tmp_path):
+    client, controller = connected_controller()
+    cp = MagicMock(number=12)
+    client.resource_get = MagicMock(side_effect=[0, '/tmp/old.log'])
+    client.resource_set_string = MagicMock()
+    client.resource_set_int = MagicMock()
+    client.checkpoint_set = MagicMock(return_value=cp)
+    client.checkpoint_delete = MagicMock(side_effect=ViceTimeoutError('unknown'))
+    client.checkpoint_list = MagicMock(return_value=[cp])
+    try:
+        _, trace = controller.start_trace([(1, 2)], 7, str(tmp_path / 'trace.log'))
+        with pytest.raises(ViceTimeoutError):
+            controller.delete_checkpoint(12)
+        assert controller._native_trace['checkpoint_ids'] == [12]
+        with pytest.raises(ViceValidationError) as caught:
+            controller.stop_trace(trace['trace_id'])
+        assert caught.value.unknown_delete is True
+        assert caught.value.checkpoint_ids == [12]
+        assert client.checkpoint_delete.call_count == 1
+    finally:
+        controller.close()
+
+
+def test_trace_preserves_primary_error_if_resume_fails():
+    client, controller = connected_controller()
+    controller._execution_state = 'running'
+    def interrupt(**kwargs):
+        controller._execution_state = 'stopped'
+        return MagicMock(event=None)
+    controller.interrupt = interrupt
+    controller.resume = MagicMock(side_effect=ViceTimeoutError('resume failed'))
+    try:
+        with pytest.raises(ViceValidationError, match='primary') as caught:
+            controller._trace_call(1000, lambda remaining: (_ for _ in ()).throw(ViceValidationError('primary')))
+        assert caught.value.resume_error['message'] == 'resume failed'
+    finally:
+        controller.close()
+
+
+def test_trace_unsent_checkpoint_timeout_is_not_unknown(tmp_path):
+    client, controller = connected_controller()
+    client.resource_get = MagicMock(side_effect=[0, '/tmp/old.log'])
+    client.checkpoint_set = MagicMock()
+    controller._remaining_ms = MagicMock(side_effect=[100, 100, ViceTimeoutError('budget')])
+    try:
+        with pytest.raises(ViceTimeoutError) as caught:
+            controller.start_trace([(1, 2)], 7, str(tmp_path / 'trace.log'))
+        assert caught.value.unknown_checkpoint is False
+        assert caught.value.logger_enabled is False
+        assert caught.value.log_filename == '/tmp/old.log'
+        client.checkpoint_set.assert_not_called()
+    finally:
+        controller.close()
+
+
+def test_stop_deletes_owned_checkpoint_after_it_is_disabled(tmp_path):
+    client, controller = connected_controller()
+    cp = MagicMock(number=12, start=1, end=2, stop_on_hit=False, enabled=True,
+                   cpu_op=7, temporary=False, memspace=0)
+    client.resource_get = MagicMock(side_effect=[0, '/tmp/old.log'])
+    client.resource_set_string = MagicMock()
+    client.resource_set_int = MagicMock()
+    client.checkpoint_set = MagicMock(return_value=cp)
+    client.checkpoint_list = MagicMock(return_value=[cp])
+    client.checkpoint_delete = MagicMock()
+    try:
+        _, trace = controller.start_trace([(1, 2)], 7, str(tmp_path / 'trace.log'))
+        cp.enabled = False
+        controller.stop_trace(trace['trace_id'])
+        assert client.checkpoint_delete.call_args.args == (12,)
+    finally:
+        controller.close()
+
+
+def test_stop_reconciles_lost_delete_ack_when_checkpoint_is_gone(tmp_path):
+    client, controller = connected_controller()
+    cp = MagicMock(number=12, start=1, end=2, stop_on_hit=False, enabled=True,
+                   cpu_op=7, temporary=False, memspace=0)
+    client.resource_get = MagicMock(side_effect=[0, '/tmp/old.log'])
+    client.resource_set_string = MagicMock()
+    client.resource_set_int = MagicMock()
+    client.checkpoint_set = MagicMock(return_value=cp)
+    client.checkpoint_list = MagicMock(side_effect=[[cp], []])
+    client.checkpoint_delete = MagicMock(side_effect=ViceTimeoutError('ack lost'))
+    try:
+        _, trace = controller.start_trace([(1, 2)], 7, str(tmp_path / 'trace.log'))
+        with pytest.raises(ViceTimeoutError) as caught:
+            controller.stop_trace(trace['trace_id'])
+        assert caught.value.checkpoint_ids == [12]
+        assert caught.value.unknown_delete is True
+        _, result = controller.stop_trace(trace['trace_id'])
+        assert result['checkpoint_ids'] == []
+        assert client.checkpoint_delete.call_count == 1
+        assert controller._native_trace is None
+    finally:
+        controller.close()

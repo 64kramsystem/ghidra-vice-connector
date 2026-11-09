@@ -164,6 +164,15 @@ def _failure(controller: ViceController, command: str, error: ViceFailure) -> st
         "memory_may_be_modified",
         "action_applied",
         "trace_sync_failed",
+        "trace_id",
+        "output_file",
+        "checkpoint_ids",
+        "logger_enabled",
+        "log_filename",
+        "unknown_checkpoint",
+        "unknown_delete",
+        "cleanup_complete",
+        "resume_error",
     ):
         if hasattr(error, name):
             details[name] = getattr(error, name)
@@ -377,6 +386,23 @@ def write_memory(
         }
 
     return _call(process, "write_memory", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_start_trace")
+def start_trace(process: C64, starts: LongArray, ends: LongArray, operations: int,
+                output_file: str, timeout_ms: int = 10_000) -> str:
+    def invoke(controller):
+        if len(starts) != len(ends):
+            raise ViceValidationError("starts and ends must have equal length")
+        return controller.start_trace(list(zip(starts, ends)), operations, output_file,
+                                      timeout_ms=timeout_ms)
+    return _call(process, "start_trace", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_stop_trace")
+def stop_trace(process: C64, trace_id: str, timeout_ms: int = 10_000) -> str:
+    return _call(process, "stop_trace", lambda controller: controller.stop_trace(
+        trace_id, timeout_ms=timeout_ms))
 
 
 @REGISTRY.method(name="c64_vice_v1_list_checkpoints")

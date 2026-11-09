@@ -51,6 +51,7 @@ CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
 CMD_SNAPSHOT_DUMP = 0x41
 CMD_SNAPSHOT_UNDUMP = 0x42
+CMD_RESOURCE_GET = 0x51
 CMD_RESOURCE_SET = 0x52
 CMD_ADVANCE_INSTRUCTIONS = 0x71
 CMD_KEYBOARD_FEED = 0x72
@@ -76,6 +77,7 @@ RESP_CHECKPOINT_TOGGLE = 0x15
 RESP_REGISTERS_GET = 0x31
 RESP_SNAPSHOT_DUMP = 0x41
 RESP_SNAPSHOT_UNDUMP = 0x42
+RESP_RESOURCE_GET = 0x51
 RESP_RESOURCE_SET = 0x52
 RESP_STOPPED = 0x62
 RESP_RESUMED = 0x63
@@ -1673,6 +1675,34 @@ class ViceBmpClient:
                 command=CMD_KEYBOARD_MATRIX_SET,
                 request_id=failure.request_id,
             ) from failure
+
+    def resource_get(self, name: str, *, timeout_ms: int = 10_000):
+        frame = self.command(
+            CMD_RESOURCE_GET, _length_prefixed_text(name, "resource name"),
+            expected=RESP_RESOURCE_GET, timeout_ms=timeout_ms,
+        )
+        cur = Cursor(frame.body, "resource get")
+        kind = cur.u8()
+        value = cur.take(cur.u8())
+        cur.finish()
+        if kind == 1 and len(value) == 4:
+            return int.from_bytes(value, "little", signed=True)
+        if kind == 0:
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ViceProtocolError("resource string is not UTF-8") from exc
+        raise ViceProtocolError("invalid resource value")
+
+    def resource_set_string(
+        self, name: str, value: str, *, timeout_ms: int = 10_000
+    ) -> None:
+        # VICE rejects a zero-length value but accepts a one-byte C empty string.
+        encoded = b"\x01\x00" if value == "" else _length_prefixed_text(value, "resource value")
+        payload = (b"\x00" + _length_prefixed_text(name, "resource name")
+                   + encoded)
+        self.command(CMD_RESOURCE_SET, payload, expected=RESP_RESOURCE_SET,
+                     timeout_ms=timeout_ms, mutating=True)
 
     def resource_set_int(
         self, name: str, value: int, *, timeout_ms: int = 10_000

@@ -7,6 +7,7 @@ The socket reader never acquires the operation lock or updates a Ghidra trace.
 from __future__ import annotations
 
 import collections
+import os
 import threading
 import time
 import uuid
@@ -120,6 +121,7 @@ class ViceController:
         self._last_event: Optional[PublicEvent] = None
         self._latest_stop: Optional[PublicEvent] = None
         self._display_capture: Optional[DisplayCapture] = None
+        self._native_trace = None
         self._connection_state = "disconnected"
         self._execution_state = "unknown"
         self._terminal_error: Optional[ViceConnectionError] = None
@@ -804,6 +806,193 @@ class ViceController:
             sync_kind="snapshot_load",
         )
 
+    def _trace_call(self, timeout_ms, action):
+        if not 1 <= timeout_ms <= 55_000:
+            raise ViceValidationError("timeout_ms must be in 1..55000")
+        deadline = time.monotonic() + timeout_ms / 1000
+        remaining = lambda: self._remaining_ms(deadline)
+        with self.operation_lock:
+            self._drain_pending(deadline, through=self._raw_watermark())
+            was_running = self.execution_state == "running"
+            resume = False
+            stop_count = self.stop_count
+            if was_running:
+                result = self.interrupt(timeout_ms=remaining())
+                stop_count = self.stop_count
+                resume = not result.event or not result.event.checkpoints
+            else:
+                self._require_stopped()
+            primary = None
+            result = None
+            entry_record = self._native_trace
+            try:
+                result = (self._next_command_sequence(), action(remaining))
+            except ViceFailure as exc:
+                primary = exc
+            record = self._native_trace or entry_record
+            try:
+                if resume:
+                    self._drain_pending(deadline, through=self._raw_watermark())
+                    if self.execution_state == "stopped" and self.stop_count == stop_count:
+                        self.resume(timeout_ms=remaining())
+            except ViceFailure as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    primary.resume_error = {"code": exc.code, "message": str(exc),
+                                            "outcome_unknown": exc.outcome_unknown}
+            if primary is not None:
+                if record is not None:
+                    primary.trace_id = record["trace_id"]
+                    primary.output_file = record["output_file"]
+                    primary.checkpoint_ids = list(record["checkpoint_ids"])
+                    primary.logger_enabled = record["logger_state"]
+                    primary.log_filename = record["filename_state"]
+                    primary.unknown_checkpoint = record["unknown_checkpoint"]
+                    primary.unknown_delete = bool(record["uncertain_deletes"])
+                    primary.partial = True
+                    primary.cleanup_complete = self._native_trace is None
+                elif result is not None:
+                    primary.trace_id = result[1]["trace_id"]
+                    primary.output_file = result[1]["output_file"]
+                    primary.checkpoint_ids = result[1]["checkpoint_ids"]
+                    primary.cleanup_complete = True
+                    primary.partial = True
+                raise primary
+            return result
+
+    def start_trace(self, ranges, operations, output_file, *, timeout_ms=10_000):
+        if not ranges or not isinstance(ranges, (list, tuple)):
+            raise ViceValidationError("ranges must be nonempty")
+        for start, end in ranges:
+            if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 65535 for v in (start, end)) or start > end:
+                raise ViceValidationError("invalid trace range")
+        if isinstance(operations, bool) or not isinstance(operations, int) or not 1 <= operations <= 7:
+            raise ViceValidationError("invalid operations mask")
+        if not isinstance(output_file, str) or not os.path.isabs(output_file) or "\x00" in output_file:
+            raise ViceValidationError("output_file must be an absolute filename")
+        try:
+            if len(output_file.encode("utf-8")) > 255:
+                raise ViceValidationError("output_file exceeds 255 UTF-8 bytes")
+        except UnicodeEncodeError as exc:
+            raise ViceValidationError("invalid output_file encoding") from exc
+
+        def start(remaining):
+            if self._native_trace is not None:
+                raise ViceValidationError("a trace is already owned")
+            if self.client.resource_get("MonitorLogEnabled", timeout_ms=remaining()) != 0:
+                raise ViceValidationError("VICE monitor logging is already enabled")
+            previous = self.client.resource_get("MonitorLogFileName", timeout_ms=remaining())
+            try:
+                with open(output_file, "xb"):
+                    pass
+            except OSError as exc:
+                raise ViceValidationError(f"cannot create output file: {exc}") from exc
+            record = {"trace_id": str(uuid.uuid4()), "output_file": output_file,
+                      "checkpoint_ids": [], "descriptors": {}, "previous": previous,
+                      "unknown_checkpoint": False, "uncertain_deletes": set(), "logger_state": False,
+                      "filename_state": previous, "logging": False, "filename": False}
+            self._native_trace = record
+            try:
+                for begin, end in ranges:
+                    budget = remaining()
+                    try:
+                        cp = self.client.checkpoint_set(begin, end, stop_on_hit=False,
+                                                        cpu_op=operations, timeout_ms=budget)
+                    except ViceFailure as exc:
+                        record["unknown_checkpoint"] = exc.outcome_unknown
+                        raise
+                    record["checkpoint_ids"].append(cp.number)
+                    record["descriptors"][cp.number] = self._checkpoint_descriptor(cp)
+                budget = remaining()
+                record["filename"] = True
+                try:
+                    self.client.resource_set_string("MonitorLogFileName", output_file, timeout_ms=budget)
+                    record["filename_state"] = output_file
+                except ViceFailure as exc:
+                    if exc.outcome_unknown:
+                        record["filename_state"] = None
+                    raise
+                budget = remaining()
+                record["logging"] = True
+                try:
+                    self.client.resource_set_int("MonitorLogEnabled", 1, timeout_ms=budget)
+                    record["logger_state"] = True
+                except ViceFailure as exc:
+                    if exc.outcome_unknown:
+                        record["logger_state"] = None
+                    raise
+                return {k: record[k] for k in ("trace_id", "output_file", "checkpoint_ids")}
+            except ViceFailure as exc:
+                exc.trace_id = record["trace_id"]
+                exc.checkpoint_ids = list(record["checkpoint_ids"])
+                exc.partial = True
+                raise
+
+        return self._trace_call(timeout_ms, start)
+
+    def stop_trace(self, trace_id, *, timeout_ms=10_000):
+        def stop(remaining):
+            record = self._native_trace
+            if record is None or record["trace_id"] != trace_id:
+                raise ViceValidationError("trace_id is not owned")
+            try:
+                if record["logging"]:
+                    budget = remaining()
+                    try:
+                        self.client.resource_set_int("MonitorLogEnabled", 0, timeout_ms=budget)
+                        record["logger_state"] = False
+                        record["logging"] = False
+                    except ViceFailure as exc:
+                        if exc.outcome_unknown:
+                            record["logger_state"] = None
+                        raise
+                checkpoints = {cp.number: cp for cp in self.client.checkpoint_list(timeout_ms=remaining())}
+                for number in list(record["checkpoint_ids"]):
+                    cp = checkpoints.get(number)
+                    if cp is None or self._checkpoint_descriptor(cp) != record["descriptors"][number]:
+                        record["checkpoint_ids"].remove(number)
+                        record["descriptors"].pop(number)
+                        record["uncertain_deletes"].discard(number)
+                        continue
+                    if number in record["uncertain_deletes"]:
+                        continue
+                    budget = remaining()
+                    try:
+                        self.client.checkpoint_delete(number, timeout_ms=budget)
+                    except ViceFailure as exc:
+                        if exc.outcome_unknown:
+                            record["uncertain_deletes"].add(number)
+                        raise
+                    record["checkpoint_ids"].remove(number)
+                    record["descriptors"].pop(number)
+                if record["filename"]:
+                    budget = remaining()
+                    try:
+                        self.client.resource_set_string("MonitorLogFileName", record["previous"], timeout_ms=budget)
+                        record["filename_state"] = record["previous"]
+                        record["filename"] = False
+                    except ViceFailure as exc:
+                        if exc.outcome_unknown:
+                            record["filename_state"] = None
+                        raise
+                if record["unknown_checkpoint"] or record["uncertain_deletes"]:
+                    raise ViceValidationError("a checkpoint operation has unknown outcome")
+                result = {"trace_id": trace_id, "output_file": record["output_file"], "checkpoint_ids": []}
+                self._native_trace = None
+                return result
+            except ViceFailure as exc:
+                exc.trace_id = record["trace_id"]
+                exc.checkpoint_ids = list(record["checkpoint_ids"])
+                exc.partial = True
+                raise
+        return self._trace_call(timeout_ms, stop)
+
+    @staticmethod
+    def _checkpoint_descriptor(cp):
+        return (cp.start, cp.end, cp.stop_on_hit, cp.cpu_op,
+                cp.temporary, cp.memspace)
+
     def list_checkpoints(
         self, *, timeout_ms: int = 10_000
     ) -> Tuple[int, List[Checkpoint]]:
@@ -854,13 +1043,27 @@ class ViceController:
             sync_kind="checkpoint_change",
         )
 
+    def _retire_trace_checkpoint(self, number):
+        record = self._native_trace
+        if record is not None and number in record["checkpoint_ids"]:
+            record["checkpoint_ids"].remove(number)
+            record["descriptors"].pop(number, None)
+            record["uncertain_deletes"].discard(number)
+
     def delete_checkpoint(
         self, number: int, *, timeout_ms: int = 10_000
     ) -> Tuple[int, List[Checkpoint]]:
         def delete_and_list(remaining):
-            self.client.checkpoint_delete(
-                number, timeout_ms=remaining()
-            )
+            budget = remaining()
+            try:
+                self.client.checkpoint_delete(number, timeout_ms=budget)
+            except ViceFailure as exc:
+                if exc.outcome_unknown:
+                    record = self._native_trace
+                    if record is not None and number in record["checkpoint_ids"]:
+                        record["uncertain_deletes"].add(number)
+                raise
+            self._retire_trace_checkpoint(number)
             try:
                 return self.client.checkpoint_list(timeout_ms=remaining())
             except BaseException as exc:

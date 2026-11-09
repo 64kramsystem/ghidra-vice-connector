@@ -26,6 +26,7 @@ from vice.protocol import (
     CMD_MEMORY_SET,
     CMD_REGISTERS_GET,
     CMD_REGISTERS_SET,
+    CMD_RESOURCE_GET,
     CMD_RESOURCE_SET,
     CMD_SNAPSHOT_DUMP,
     CMD_SNAPSHOT_UNDUMP,
@@ -48,6 +49,7 @@ from vice.protocol import (
     RESP_MEMORY_GET,
     RESP_MEMORY_SET,
     RESP_REGISTERS_GET,
+    RESP_RESOURCE_GET,
     RESP_RESOURCE_SET,
     RESP_SNAPSHOT_DUMP,
     RESP_SNAPSHOT_UNDUMP,
@@ -343,6 +345,20 @@ def test_keyboard_joyport_resource_and_snapshot_wire_formats(connected_client):
     )
     assert seen["snapshot_save"] == b"\x01\x00\x09start.vsf"
     assert seen["snapshot_load"] == b"\x09start.vsf"
+
+
+def test_resource_get_and_string_set_wire_formats(connected_client):
+    client, server = connected_client
+    seen = []
+    server.handle(CMD_RESOURCE_GET, lambda payload: (
+        seen.append(payload), (RESP_RESOURCE_GET, b"\x00\x05a.log")
+    )[1])
+    server.handle(CMD_RESOURCE_SET, lambda payload: (
+        seen.append(payload), (RESP_RESOURCE_SET, b"")
+    )[1])
+    assert client.resource_get("MonitorLogFileName") == "a.log"
+    client.resource_set_string("MonitorLogFileName", "/tmp/a.log")
+    assert seen == [b"\x12MonitorLogFileName", b"\x00\x12MonitorLogFileName\x0a/tmp/a.log"]
 
 
 def test_keyboard_matrix_on_a_build_without_the_command_is_an_unsupported_build(

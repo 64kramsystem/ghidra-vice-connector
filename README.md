@@ -14,6 +14,8 @@ A Ghidra 12.2 debugger extension for the Commodore 64. It connects one Ghidra Tr
 
 The controller serializes monitor commands and publishes VICE stop/resume events to the trace. Memory and display transfers use 16 KiB chunks so no single TraceRMI value carries a full frame or memory image.
 
+Automation can start and stop a native monitor log for inclusive main-memory ranges. The controller owns the trace checkpoints and restores the previous monitor log filename on stop.
+
 ## Requirements
 
 - Ghidra 12.2
