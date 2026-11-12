@@ -508,3 +508,164 @@ def test_stop_reconciles_lost_delete_ack_when_checkpoint_is_gone(tmp_path):
         assert controller._native_trace is None
     finally:
         controller.close()
+
+
+def test_frame_cleanup_runs_when_intermediate_trace_sync_fails():
+    def sync(event, _remaining):
+        if event.kind == "checkpoint_hit":
+            raise RuntimeError("sync failed")
+
+    client, controller = connected_controller(sync=sync)
+    client.registers_get = lambda *args, **kwargs: {"PC": 0x1000, "LIN": 1}
+    client.checkpoint_set = lambda *args, **kwargs: Checkpoint(42, 0, 65535)
+    client.checkpoint_condition = lambda *args, **kwargs: None
+    client.checkpoint_toggle = lambda *args, **kwargs: None
+    deleted = []
+    client.checkpoint_delete = lambda number, **kwargs: deleted.append(number)
+    client.checkpoint_list = lambda **kwargs: []
+    hit = raw(2, "checkpoint_hit", checkpoints=(Checkpoint(7, 1, 1, stop_on_hit=False),))
+    client.next_events = [raw(1, "resumed"), hit, raw(3, "stopped")]
+    with pytest.raises(ViceTraceSyncError):
+        controller.advance_frames(1)
+    assert deleted == [42]
+    assert controller.execution_state == "stopped"
+    assert controller.status()["stop_count"] == 1
+    controller.close()
+
+
+def test_frame_cleanup_failure_preserves_primary_error():
+    client, controller = connected_controller()
+    client.registers_get = lambda *args, **kwargs: {"PC": 0x1000, "LIN": 1}
+    client.checkpoint_set = lambda *args, **kwargs: Checkpoint(42, 0, 65535)
+    client.checkpoint_condition = MagicMock(side_effect=ViceConnectionError("primary"))
+    client.checkpoint_delete = MagicMock(side_effect=ViceConnectionError("cleanup"))
+    client.checkpoint_list = lambda **kwargs: []
+    with pytest.raises(ViceConnectionError, match="primary") as caught:
+        controller.advance_frames(1)
+    assert caught.value.cleanup_complete is False
+    assert controller.execution_state == "stopped"
+    assert controller.get_registers()[1]["PC"] == 0x1000
+    client.checkpoint_delete.assert_called_once()
+    controller.close()
+
+
+def test_frame_unknown_checkpoint_creation_reports_incomplete_cleanup():
+    client, controller = connected_controller()
+    client.registers_get = lambda *args, **kwargs: {"PC": 0x1000, "LIN": 1}
+    client.checkpoint_set = MagicMock(side_effect=ViceTimeoutError("unknown checkpoint"))
+    client.checkpoint_list = lambda **kwargs: []
+    with pytest.raises(ViceTimeoutError, match="unknown checkpoint") as caught:
+        controller.advance_frames(1)
+    assert caught.value.cleanup_complete is False
+    assert caught.value.unknown_checkpoint is True
+    controller.close()
+
+
+def test_frame_rejected_setup_restores_stopped_state():
+    client, controller = connected_controller()
+    client.registers_get = lambda *args, **kwargs: {"PC": 0x1000, "LIN": 1}
+    client.checkpoint_set = lambda *args, **kwargs: Checkpoint(42, 0, 65535)
+    client.checkpoint_condition = MagicMock(side_effect=ViceValidationError("rejected"))
+    client.checkpoint_delete = MagicMock()
+    client.checkpoint_list = lambda **kwargs: []
+    with pytest.raises(ViceValidationError, match="rejected"):
+        controller.advance_frames(1)
+    assert controller.execution_state == "stopped"
+    assert controller.get_registers()[1]["PC"] == 0x1000
+    client.checkpoint_delete.assert_called_once()
+    controller.close()
+
+
+def test_frame_timeout_with_continuous_nonstopping_hits():
+    client, controller = connected_controller()
+    client.registers_get = lambda *args, **kwargs: {"PC": 0x1000, "LIN": 1}
+    client.checkpoint_set = lambda *args, **kwargs: Checkpoint(42, 0, 65535)
+    client.checkpoint_condition = lambda *args, **kwargs: None
+    client.checkpoint_toggle = lambda *args, **kwargs: None
+    client.checkpoint_delete = MagicMock()
+    client.checkpoint_list = lambda **kwargs: []
+    interrupted = []
+    def interrupt(*, timeout_ms):
+        interrupted.append(True)
+        client.emit(raw(500, "stopped"))
+        return 1
+    client.acknowledge_interrupt = interrupt
+    original_pop = controller._pop_raw
+    def stream(deadline, *, require):
+        if require and not interrupted:
+            return raw(1, "checkpoint_hit", checkpoints=(Checkpoint(7, 1, 1, stop_on_hit=False),))
+        return original_pop(deadline, require=require)
+    controller._pop_raw = stream
+    _, result = controller.advance_frames(2, timeout_ms=10)
+    assert result["reason"] == "timeout"
+    assert interrupted == [True]
+    assert controller.execution_state == "stopped"
+    assert controller.status()["stop_count"] == 1
+    client.checkpoint_delete.assert_called_once()
+    controller.close()
+
+
+def test_already_target_reports_observed_pc_without_new_stop():
+    client, controller = connected_controller()
+    client.emit(raw(1, "stopped", pc=0x1234))
+    with controller.operation_lock:
+        controller._drain_pending()
+    previous = controller._latest_stop
+    client.registers_get = lambda *args, **kwargs: {"PC": 0, "LIN": 1}
+    before = controller.status()["stop_count"]
+    _, result = controller.run_until(0, 1)
+    assert result["reason"] == "target"
+    assert result["frames_completed"] == 0
+    assert controller.status()["pc"] == 0
+    assert controller.status()["stop_count"] == before
+    assert controller._latest_stop == previous
+    controller.close()
+
+
+@pytest.mark.parametrize("intermediate_failure", [False, True])
+def test_frame_final_sync_failure_preserves_known_stop_and_primary(intermediate_failure):
+    def sync(event, _remaining):
+        if event.kind == "stopped" or (intermediate_failure and event.kind == "checkpoint_hit"):
+            raise RuntimeError("sync " + event.kind)
+
+    client, controller = connected_controller(sync=sync)
+    client.registers_get = lambda *args, **kwargs: {"PC": 0x1000, "LIN": 1}
+    cp = Checkpoint(42, 0, 65535)
+    client.checkpoint_set = lambda *args, **kwargs: cp
+    client.checkpoint_condition = lambda *args, **kwargs: None
+    client.checkpoint_toggle = lambda *args, **kwargs: None
+    client.checkpoint_delete = lambda *args, **kwargs: None
+    client.checkpoint_list = lambda **kwargs: []
+    events = [raw(1, "resumed")]
+    if intermediate_failure:
+        events.append(raw(2, "checkpoint_hit", checkpoints=(Checkpoint(7, 1, 1, stop_on_hit=False),)))
+    events.append(raw(3, "stopped", checkpoints=(cp,)))
+    client.next_events = events
+    with pytest.raises(ViceTraceSyncError, match="checkpoint_hit" if intermediate_failure else "stopped"):
+        controller.advance_frames(1)
+    assert controller.execution_state == "stopped"
+    assert controller.status()["stop_count"] == 1
+    assert controller.get_registers()[1]["PC"] == 0x1000
+    controller.close()
+
+
+def test_frame_expired_budget_before_creation_does_not_invent_unknown_checkpoint():
+    client, controller = connected_controller()
+    client.registers_get = lambda *args, **kwargs: {"PC": 0x1000, "LIN": 1}
+    client.checkpoint_set = MagicMock()
+    client.checkpoint_list = lambda **kwargs: []
+    budgets = iter([100, ViceTimeoutError("expired"), 100])
+
+    def remaining(_deadline):
+        value = next(budgets)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    controller._remaining_ms = remaining
+    _, result = controller.advance_frames(1)
+    assert result["reason"] == "timeout"
+    assert result["frames_completed"] == 0
+    assert controller.execution_state == "stopped"
+    client.checkpoint_set.assert_not_called()
+    controller.close()

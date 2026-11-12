@@ -11,7 +11,7 @@ import os
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from .contracts import LIMITS
@@ -118,6 +118,7 @@ class ViceController:
         self._command_sequence = 0
         self._last_raw_sequence = 0
         self._stop_count = 0
+        self._current_pc: Optional[int] = None
         self._last_event: Optional[PublicEvent] = None
         self._latest_stop: Optional[PublicEvent] = None
         self._display_capture: Optional[DisplayCapture] = None
@@ -295,6 +296,7 @@ class ViceController:
                 "stopped" if event.kind == "stopped" else "running"
             )
             self._last_event = public
+            self._current_pc = event.pc
             if event.kind == "stopped":
                 self._stop_count += 1
                 self._latest_stop = public
@@ -434,6 +436,177 @@ class ViceController:
                     last = published
                     matched += 1
             return OperationResult(sequence, request_id, last)
+
+    def advance_frames(self, frame_count: int, *, timeout_ms: int = 10_000):
+        return self._frame_operation(frame_count, None, timeout_ms)
+
+    def run_until(self, address: int, max_frames: int, *, timeout_ms: int = 10_000):
+        if isinstance(address, bool) or not isinstance(address, int) or not 0 <= address <= 65535:
+            raise ViceValidationError("address must be in 0..65535")
+        return self._frame_operation(max_frames, address, timeout_ms)
+
+    def _frame_operation(self, count: int, address: Optional[int], timeout_ms: int):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ViceValidationError("frame count must be positive")
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or not 1 <= timeout_ms <= 55000:
+            raise ViceValidationError("timeout_ms must be in 1..55000")
+        deadline = time.monotonic() + timeout_ms / 1000
+        cleanup_deadline = deadline + 2.0
+        with self.operation_lock:
+            self._drain_pending(deadline, through=self._raw_watermark())
+            self._require_stopped()
+            sequence = self._next_command_sequence()
+            remaining = lambda: self._remaining_ms(deadline)
+            registers = self.client.registers_get(timeout_ms=remaining())
+            if address is not None and registers["PC"] == address:
+                with self._condition:
+                    self._current_pc = address
+                return sequence, {"reason": "target", "frames_completed": 0, "request_id": None, "event": None}
+            owned = []
+            cp = None
+            seek_zero = registers["LIN"] != 0
+            unknown = False
+            stopped = True
+            final = None
+            request_id = None
+            completed = 0
+            reason = None
+            primary = None
+            with self._condition:
+                self._execution_state = "transitioning"
+            try:
+                budget = remaining()
+                try:
+                    cp = self.client.checkpoint_set(0, 65535, enabled=False, timeout_ms=budget)
+                except ViceFailure as exc:
+                    unknown = exc.outcome_unknown
+                    raise
+                owned.append(cp.number)
+                if address is not None:
+                    budget = remaining()
+                    try:
+                        target = self.client.checkpoint_set(address, address, timeout_ms=budget)
+                    except ViceFailure as exc:
+                        unknown = exc.outcome_unknown
+                        raise
+                    owned.append(target.number)
+                while True:
+                    self.client.checkpoint_condition(cp.number, "RL == $0" if seek_zero else "RL != $0", timeout_ms=remaining())
+                    self.client.checkpoint_toggle(cp.number, True, timeout_ms=remaining())
+                    budget = remaining()
+                    stopped = False
+                    try:
+                        request_id = self.client.acknowledge_resume(timeout_ms=budget)
+                    except ViceFailure as exc:
+                        if not exc.outcome_unknown:
+                            stopped = True
+                        raise
+                    while True:
+                        remaining()
+                        raw = self._pop_raw(deadline, require=True)
+                        assert raw is not None
+                        if raw.kind == "resumed":
+                            continue
+                        if raw.kind != "stopped":
+                            self._publish(raw, action_applied=True, deadline=deadline)
+                            with self._condition:
+                                self._execution_state = "transitioning"
+                            continue
+                        stopped = True
+                        final = raw
+                        break
+                    hits = {item.number for item in raw.checkpoints}
+                    if seek_zero and cp.number in hits:
+                        completed += 1
+                    if address is not None and owned[1] in hits:
+                        reason = "target"
+                    elif hits.difference(owned):
+                        reason = "checkpoint"
+                    elif cp.number not in hits:
+                        reason = "stopped"
+                    elif completed >= count:
+                        reason = "frame_limit" if address is not None else "frames"
+                    if reason:
+                        break
+                    seek_zero = not seek_zero
+            except BaseException as exc:
+                if isinstance(exc, ViceTimeoutError) and not unknown:
+                    reason = "timeout"
+                else:
+                    primary = exc
+                deadline = cleanup_deadline
+                try:
+                    watermark = self._raw_watermark()
+                    while self._has_raw_at_or_before(watermark):
+                        remaining()
+                        raw = self._pop_raw(None, require=False)
+                        if raw is None:
+                            break
+                        if raw.kind == "stopped":
+                            stopped, final = True, raw
+                            if cp is not None and seek_zero and cp.number in {item.number for item in raw.checkpoints}:
+                                completed += 1
+                        elif raw.kind != "resumed":
+                            self._publish(raw, action_applied=True, deadline=deadline)
+                    if not stopped:
+                        self.client.acknowledge_interrupt(timeout_ms=remaining())
+                        while True:
+                            remaining()
+                            raw = self._pop_raw(deadline, require=True)
+                            assert raw is not None
+                            if raw.kind == "stopped":
+                                stopped, final = True, raw
+                                if cp is not None and seek_zero and cp.number in {item.number for item in raw.checkpoints}:
+                                    completed += 1
+                                break
+                            if raw.kind != "resumed":
+                                self._publish(raw, action_applied=True, deadline=deadline)
+                except BaseException as recovery_error:
+                    with self._condition:
+                        if self._connection_state == "connected":
+                            self._execution_state = "transitioning"
+                    if primary is None:
+                        primary = recovery_error
+                    primary.cleanup_complete = False
+            deadline = cleanup_deadline
+            cleanup_error = None
+            for number in reversed(owned):
+                try:
+                    self.client.checkpoint_delete(number, timeout_ms=remaining())
+                except BaseException as exc:
+                    cleanup_error = cleanup_error or exc
+            try:
+                checkpoints = self.client.checkpoint_list(timeout_ms=remaining())
+                try:
+                    self._sync_result("checkpoints", checkpoints, remaining)
+                except BaseException as exc:
+                    raise self._post_action_sync_error("checkpoints", exc) from exc
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+            if unknown or cleanup_error:
+                if primary is None:
+                    primary = cleanup_error or ViceProtocolError("checkpoint creation outcome unknown")
+                primary.cleanup_complete = False
+                primary.unknown_checkpoint = unknown
+            event = None
+            with self._condition:
+                connected = self._connection_state == "connected"
+            if stopped and connected:
+                if final is not None and not unknown and cleanup_error is None:
+                    final = replace(final, checkpoints=tuple(item for item in final.checkpoints if item.number not in owned))
+                    try:
+                        event = self._publish(final, action_applied=True, deadline=deadline)
+                    except BaseException:
+                        if primary is None:
+                            raise
+                        primary.trace_sync_failed = True
+                else:
+                    with self._condition:
+                        if self._connection_state == "connected":
+                            self._execution_state = "stopped"
+            if primary is not None:
+                raise primary
+            return sequence, {"reason": reason, "frames_completed": completed, "request_id": request_id, "event": event}
 
     def step(
         self, count: int = 1, *, step_over: bool = False,
@@ -1110,14 +1283,13 @@ class ViceController:
 
     def status(self) -> Dict[str, object]:
         with self._condition:
-            event = self._last_event
             return {
                 "instance_id": self.instance_id,
                 "connection_state": self._connection_state,
                 "execution_state": self._execution_state,
                 "command_sequence": self._command_sequence,
                 "stop_count": self._stop_count,
-                "pc": event.pc if event else None,
+                "pc": self._current_pc,
                 "terminal_error": (
                     str(self._terminal_error)
                     if self._terminal_error is not None else None

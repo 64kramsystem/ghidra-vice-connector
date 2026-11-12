@@ -47,6 +47,7 @@ CMD_CHECKPOINT_SET = 0x12
 CMD_CHECKPOINT_DELETE = 0x13
 CMD_CHECKPOINT_LIST = 0x14
 CMD_CHECKPOINT_TOGGLE = 0x15
+CMD_CONDITION_SET = 0x22
 CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
 CMD_SNAPSHOT_DUMP = 0x41
@@ -74,6 +75,7 @@ RESP_CHECKPOINT_INFO = 0x11
 RESP_CHECKPOINT_DELETE = 0x13
 RESP_CHECKPOINT_LIST = 0x14
 RESP_CHECKPOINT_TOGGLE = 0x15
+RESP_CONDITION_SET = 0x22
 RESP_REGISTERS_GET = 0x31
 RESP_SNAPSHOT_DUMP = 0x41
 RESP_SNAPSHOT_UNDUMP = 0x42
@@ -1420,6 +1422,14 @@ class ViceBmpClient:
             mutating=True,
         )
         return parse_checkpoint_info(frame.body)
+
+    def checkpoint_condition(self, number: int, expression: str, *, timeout_ms: int) -> None:
+        _validate_id(number, "checkpoint number", 0xFFFFFFFF)
+        if expression not in ("RL == $0", "RL != $0"):
+            raise ViceValidationError("unsupported checkpoint condition")
+        encoded = expression.encode("ascii")
+        self.command(CMD_CONDITION_SET, struct.pack("<IB", number, len(encoded)) + encoded,
+                     expected=RESP_CONDITION_SET, timeout_ms=timeout_ms, mutating=True)
 
     def checkpoint_delete(
         self, number: int, *, timeout_ms: int = 10_000

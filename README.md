@@ -14,6 +14,8 @@ A Ghidra 12.2 debugger extension for the Commodore 64. It connects one Ghidra Tr
 
 The controller serializes monitor commands and publishes VICE stop/resume events to the trace. Memory and display transfers use 16 KiB chunks so no single TraceRMI value carries a full frame or memory image.
 
+Automation can advance observed frames or run until an address with a frame limit. A frame is the first CPU instruction boundary observed on raster line 0 after a nonzero line; long REU DMA can skip an observation. Both operations start stopped, publish one final stop after helper checkpoint cleanup, and return partial progress on timeout after recovery. An already-current target returns without another stop.
+
 Automation can start and stop a native monitor log for inclusive main-memory ranges. The controller owns the trace checkpoints and restores the previous monitor log filename on stop.
 
 ## Requirements
@@ -83,3 +85,5 @@ edit the generated `schema.xml`.
 For the full C64 MCP/TraceRMI integration test, use
 `ghidra-mcp-next/tools/test_debugger_stacks.py --stack vice --ghidra "$GHIDRA_INSTALL_DIR"`
 with sibling checkouts and a disposable VICE executable.
+
+To run the mutating live tests, start a disposable VICE monitor on a private port and run `REQUIRE_LIVE_VICE=1 VICE_PORT=<port> pytest tests/test_live_vice.py`.

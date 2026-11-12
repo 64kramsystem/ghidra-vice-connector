@@ -489,6 +489,24 @@ def _execution_call(process: C64, command: str, callback) -> str:
     )
 
 
+def _frame_call(process, command, callback):
+    def invoke(controller):
+        sequence, result = callback(controller)
+        result["event"] = _event(result["event"]) if result["event"] is not None else None
+        return sequence, result
+    return _call(process, command, invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_advance_frames")
+def advance_frames(process: C64, frame_count: int, timeout_ms: int = 10_000) -> str:
+    return _frame_call(process, "advance_frames", lambda controller: controller.advance_frames(frame_count, timeout_ms=timeout_ms))
+
+
+@REGISTRY.method(name="c64_vice_v1_run_until")
+def run_until(process: C64, address: int, max_frames: int, timeout_ms: int = 10_000) -> str:
+    return _frame_call(process, "run_until", lambda controller: controller.run_until(address, max_frames, timeout_ms=timeout_ms))
+
+
 @REGISTRY.method(name="c64_vice_v1_step")
 def step(process: C64, count: int = 1, timeout_ms: int = 10_000) -> str:
     return _execution_call(
