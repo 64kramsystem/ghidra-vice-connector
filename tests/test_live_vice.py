@@ -25,6 +25,7 @@ from vice.protocol import (
 
 VICE_HOST = os.environ.get("VICE_HOST", "127.0.0.1")
 VICE_PORT = int(os.environ.get("VICE_PORT", "6502"))
+_LIVE_OPT_IN = bool(os.environ.get("REQUIRE_LIVE_VICE") or os.environ.get("REQUIRE_KEYBOARD_MATRIX")) and "VICE_PORT" in os.environ
 
 
 def _vice_reachable():
@@ -36,7 +37,7 @@ def _vice_reachable():
         return False
 
 
-_VICE_UP = _vice_reachable()
+_VICE_UP = _LIVE_OPT_IN and _vice_reachable()
 
 # CI boots an emulator and sets REQUIRE_LIVE_VICE so a VICE boot failure fails the suite
 # instead of silently skipping it. REQUIRE_KEYBOARD_MATRIX implies the same demand: asking for a
@@ -51,7 +52,7 @@ if _STRICT and not _VICE_UP:
 
 pytestmark = pytest.mark.skipif(
     not _VICE_UP,
-    reason=f"VICE not reachable on {VICE_HOST}:{VICE_PORT}",
+    reason="set REQUIRE_LIVE_VICE=1 and VICE_PORT for a disposable VICE",
 )
 
 
