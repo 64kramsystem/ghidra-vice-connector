@@ -61,6 +61,7 @@ CMD_PING = 0x81
 CMD_BANKS_AVAILABLE = 0x82
 CMD_REGISTERS_AVAILABLE = 0x83
 CMD_DISPLAY_GET = 0x84
+CMD_CPU_HISTORY_GET = 0x86
 CMD_VICE_INFO = 0x85
 CMD_PALETTE_GET = 0x91
 CMD_JOYPORT_SET = 0xA2
@@ -90,6 +91,7 @@ RESP_PING = 0x81
 RESP_BANKS_AVAILABLE = 0x82
 RESP_REGISTERS_AVAILABLE = 0x83
 RESP_DISPLAY_GET = 0x84
+RESP_CPU_HISTORY_GET = 0x86
 RESP_VICE_INFO = 0x85
 RESP_PALETTE_GET = 0x91
 RESP_JOYPORT_SET = 0xA2
@@ -384,6 +386,9 @@ class Cursor:
 
     def u32(self) -> int:
         return struct.unpack("<I", self.take(4))[0]
+
+    def u64(self) -> int:
+        return struct.unpack("<Q", self.take(8))[0]
 
     def finish(self) -> None:
         if self.remaining:
@@ -1211,6 +1216,11 @@ class ViceBmpClient:
 
     def _parse_register_values(self, body: bytes) -> Dict[str, int]:
         cur = Cursor(body, "register values")
+        result = self._read_register_values(cur)
+        cur.finish()
+        return result
+
+    def _read_register_values(self, cur: Cursor) -> Dict[str, int]:
         count = cur.u16()
         if count > MAX_LIST_ITEMS:
             raise ViceProtocolError(f"register count {count} exceeds {MAX_LIST_ITEMS}")
@@ -1239,8 +1249,31 @@ class ViceBmpClient:
                     f"register {name} value {value} exceeds {bits} bits"
                 )
             result[name] = value
-        cur.finish()
         return result
+
+    def cpu_history(self, count: int, *, timeout_ms: int = 10_000) -> list:
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= MAX_LIST_ITEMS:
+            raise ViceValidationError(f"count must be in 1..{MAX_LIST_ITEMS}")
+        frame = self.command(CMD_CPU_HISTORY_GET, struct.pack("<BI", MEMSPACE_MAIN, count),
+                             expected=RESP_CPU_HISTORY_GET, timeout_ms=timeout_ms)
+        cur = Cursor(frame.body, "CPU history")
+        actual = cur.u32()
+        if actual > count:
+            raise ViceProtocolError("CPU history count exceeds request")
+        entries = []
+        for index in range(actual):
+            item = Cursor(cur.take(cur.u8()), f"CPU history item {index}")
+            values = self._read_register_values(item)
+            if not {"PC", "A", "X", "Y", "SP", "FL"} <= values.keys():
+                raise ViceProtocolError("CPU history record is missing required registers")
+            cycle = item.u64()
+            instruction = item.take(item.u8())
+            if len(instruction) != 4 or instruction[3] != 0xff:
+                raise ViceProtocolError("invalid CPU history instruction bytes")
+            item.finish()
+            entries.append((values, cycle, instruction[:3]))
+        cur.finish()
+        return entries
 
     def registers_set(
         self,

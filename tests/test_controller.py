@@ -669,3 +669,27 @@ def test_frame_expired_budget_before_creation_does_not_invent_unknown_checkpoint
     assert controller.execution_state == "stopped"
     client.checkpoint_set.assert_not_called()
     controller.close()
+
+
+def test_cpu_history_requires_stopped_and_serializes_without_trace_sync():
+    client, controller = connected_controller()
+    entered = threading.Event()
+    release = threading.Event()
+    def history(count, timeout_ms):
+        entered.set()
+        assert release.wait(2)
+        return []
+    client.cpu_history = MagicMock(side_effect=history)
+    controller._sync_result = MagicMock()
+    thread = threading.Thread(target=lambda: controller.cpu_history(3))
+    thread.start()
+    assert entered.wait(2)
+    assert not controller.operation_lock.acquire(blocking=False)
+    release.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    controller._sync_result.assert_not_called()
+    controller._execution_state = "running"
+    with pytest.raises(ViceStateError):
+        controller.cpu_history(3)
+    assert client.cpu_history.call_count == 1

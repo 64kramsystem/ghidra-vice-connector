@@ -497,6 +497,17 @@ def _frame_call(process, command, callback):
     return _call(process, command, invoke)
 
 
+@REGISTRY.method(name="c64_vice_v1_cpu_history")
+def cpu_history(process: C64, count: int = 64, timeout_ms: int = 10_000) -> str:
+    def invoke(controller):
+        sequence, history = controller.cpu_history(count, timeout_ms=timeout_ms)
+        entries = [{"cycle": cycle, "instruction_prefix": prefix.hex(),
+                    "registers": _register_records(controller, values, ["PC", "A", "X", "Y", "SP", "FL"])}
+                   for values, cycle, prefix in history]
+        return sequence, {"count": len(entries), "entries": entries}
+    return _call(process, "cpu_history", invoke)
+
+
 @REGISTRY.method(name="c64_vice_v1_advance_frames")
 def advance_frames(process: C64, frame_count: int, timeout_ms: int = 10_000) -> str:
     return _frame_call(process, "advance_frames", lambda controller: controller.advance_frames(frame_count, timeout_ms=timeout_ms))

@@ -4,6 +4,8 @@
 
 ### Added
 
+- Bounded, read-only main-CPU history through TraceRMI.
+
 - TraceRMI methods for advancing observed frames and running to an address with a frame limit on stock VICE.
 
 ## 0.104.0

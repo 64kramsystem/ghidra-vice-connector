@@ -706,6 +706,12 @@ class ViceController:
             cause=cause,
         )
 
+    def cpu_history(self, count: int, *, timeout_ms: int = 10_000):
+        return self._stopped_call(
+            lambda remaining: self.client.cpu_history(count, timeout_ms=remaining()),
+            timeout_ms=timeout_ms,
+        )
+
     def get_registers(
         self, memspace: int = MEMSPACE_MAIN, *, timeout_ms: int = 10_000
     ) -> Tuple[int, Dict[str, int]]:

@@ -156,3 +156,16 @@ def test_input_and_snapshot_envelopes_forward_exact_arguments(controller):
     controller.load_snapshot.assert_called_once_with(
         "start.vsf", timeout_ms=1000
     )
+
+
+def test_cpu_history_json_preserves_full_cycle_and_omits_placeholders(controller):
+    names = ["PC", "A", "X", "Y", "SP", "FL", "LIN", "CYC"]
+    controller.client.reg_name_to_id = {name: index for index, name in enumerate(names)}
+    controller.client.reg_name_to_bits = {name: 16 if name in ("PC", "LIN", "CYC") else 8 for name in names}
+    values = dict(zip(names, [0xC000, 1, 2, 3, 0xFF, 0x20, 0xFFFF, 0xFFFF]))
+    controller.cpu_history.return_value = (8, [(values, 2**64 - 1, b'\xa9\x01\x00')])
+    result = payload(automation.cpu_history(process()))["result"]
+    assert result["count"] == 1
+    assert result["entries"][0]["cycle"] == 2**64 - 1
+    assert result["entries"][0]["instruction_prefix"] == "a90100"
+    assert [r["name"] for r in result["entries"][0]["registers"]] == names[:6]

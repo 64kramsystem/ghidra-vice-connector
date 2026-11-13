@@ -580,3 +580,39 @@ def test_parallel_ping_correlation(connected_client):
     for thread in threads:
         thread.join(2)
     assert results == [True] * 10
+
+
+def test_cpu_history_wire_and_strict_records(connected_client):
+    from vice.protocol import CMD_CPU_HISTORY_GET, RESP_CPU_HISTORY_GET
+    client, server = connected_client
+    values = {"PC": 0xC000, "A": 1, "X": 2, "Y": 3, "SP": 0xFF, "FLAGS": 0x20}
+    regs = build_registers_get_body(values)
+    client.reg_id_to_name[5] = "FL"
+    client.reg_name_to_bits["FL"] = client.reg_name_to_bits["FLAGS"]
+    expected = {("FL" if name == "FLAGS" else name): value for name, value in values.items()}
+    def item(cycle, code):
+        data = regs + struct.pack('<Q', cycle) + b'\x04' + code + b'\xff'
+        return bytes([len(data)]) + data
+    body = struct.pack('<I', 2) + item(100, b'\xa9\x01\x00') + item(6, b'\xea\x00\x00')
+    def respond(request):
+        assert request == struct.pack('<BI', 0, 3)
+        return RESP_CPU_HISTORY_GET, body
+    server.handle(CMD_CPU_HISTORY_GET, respond)
+    history = client.cpu_history(3)
+    assert [entry[1] for entry in history] == [100, 6]
+    assert history[0] == (expected, 100, b'\xa9\x01\x00')
+    for malformed in (body[:-1], body + b'\x00', struct.pack('<I', 4), body[:-1] + b'\x00'):
+        server.handle(CMD_CPU_HISTORY_GET, lambda _, data=malformed: (RESP_CPU_HISTORY_GET, data))
+        with pytest.raises(ViceProtocolError):
+            client.cpu_history(3)
+    missing = build_registers_get_body({k: v for k, v in values.items() if k != "A"})
+    record = missing + struct.pack("<Q", 0) + b"\x04\xea\x00\x00\xff"
+    server.handle(CMD_CPU_HISTORY_GET, lambda _: (RESP_CPU_HISTORY_GET,
+                  struct.pack("<I", 1) + bytes([len(record)]) + record))
+    with pytest.raises(ViceProtocolError, match="missing required registers"):
+        client.cpu_history(3)
+    server.handle(CMD_CPU_HISTORY_GET, lambda _: (RESP_CPU_HISTORY_GET, struct.pack('<I', 0)))
+    assert client.cpu_history(3) == []
+    for invalid in (True, 0, 4097):
+        with pytest.raises(ViceValidationError):
+            client.cpu_history(invalid)

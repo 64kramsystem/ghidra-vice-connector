@@ -14,6 +14,8 @@ A Ghidra 12.2 debugger extension for the Commodore 64. It connects one Ghidra Tr
 
 The controller serializes monitor commands and publishes VICE stop/resume events to the trace. Memory and display transfers use 16 KiB chunks so no single TraceRMI value carries a full frame or memory image.
 
+Automation can read bounded main-CPU instruction history while stopped. VICE must be built with `--enable-cpuhistory`. Entries are oldest to newest, with pre-instruction registers and fetch-start cycles; cycles can decrease across resets or snapshot restores. The three saved instruction-prefix bytes are not a decoded instruction length, and unused operand slots may contain zero or neighboring bytes.
+
 Automation can advance observed frames or run until an address with a frame limit. A frame is the first CPU instruction boundary observed on raster line 0 after a nonzero line; long REU DMA can skip an observation. Both operations start stopped, publish one final stop after helper checkpoint cleanup, and return partial progress on timeout after recovery. An already-current target returns without another stop.
 
 Automation can start and stop a native monitor log for inclusive main-memory ranges. The controller owns the trace checkpoints and restores the previous monitor log filename on stop.
