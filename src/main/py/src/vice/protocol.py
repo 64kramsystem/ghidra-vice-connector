@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import queue
 import select
 import socket
@@ -48,6 +49,8 @@ CMD_CHECKPOINT_DELETE = 0x13
 CMD_CHECKPOINT_LIST = 0x14
 CMD_CHECKPOINT_TOGGLE = 0x15
 CMD_CONDITION_SET = 0x22
+
+CMD_AUTOSTART = 0xDD
 CMD_REGISTERS_GET = 0x31
 CMD_REGISTERS_SET = 0x32
 CMD_SNAPSHOT_DUMP = 0x41
@@ -77,6 +80,8 @@ RESP_CHECKPOINT_DELETE = 0x13
 RESP_CHECKPOINT_LIST = 0x14
 RESP_CHECKPOINT_TOGGLE = 0x15
 RESP_CONDITION_SET = 0x22
+
+RESP_AUTOSTART = 0xDD
 RESP_REGISTERS_GET = 0x31
 RESP_SNAPSHOT_DUMP = 0x41
 RESP_SNAPSHOT_UNDUMP = 0x42
@@ -625,6 +630,22 @@ def _length_prefixed_text(value: str, field: str) -> bytes:
     if b"\x00" in encoded:
         raise ViceValidationError(f"{field} must not contain NUL")
     return bytes((len(encoded),)) + encoded
+
+
+def validate_condition(condition: str) -> bytes:
+    encoded = _length_prefixed_text(condition, "condition")
+    if any(char in condition for char in ";\r\n"):
+        raise ViceValidationError("condition must not contain command separators or newlines")
+    return encoded
+
+
+def validate_autostart(filename: str, file_index: int, run: bool) -> bytes:
+    encoded = _length_prefixed_text(filename, "autostart filename")
+    if not os.path.isabs(filename):
+        raise ViceValidationError("autostart filename must be absolute")
+    _validate_id(file_index, "file_index")
+    _validate_bool(run, "run")
+    return struct.pack("<BH", int(run), file_index) + encoded
 
 
 class ViceBmpClient:
@@ -1456,13 +1477,11 @@ class ViceBmpClient:
         )
         return parse_checkpoint_info(frame.body)
 
-    def checkpoint_condition(self, number: int, expression: str, *, timeout_ms: int) -> None:
+    def checkpoint_condition(self, number: int, condition: str, *, timeout_ms: int = 10_000) -> None:
         _validate_id(number, "checkpoint number", 0xFFFFFFFF)
-        if expression not in ("RL == $0", "RL != $0"):
-            raise ViceValidationError("unsupported checkpoint condition")
-        encoded = expression.encode("ascii")
-        self.command(CMD_CONDITION_SET, struct.pack("<IB", number, len(encoded)) + encoded,
-                     expected=RESP_CONDITION_SET, timeout_ms=timeout_ms, mutating=True)
+        frame = self.command(CMD_CONDITION_SET, struct.pack("<I", number) + validate_condition(condition),
+                             expected=RESP_CONDITION_SET, timeout_ms=timeout_ms, mutating=True)
+        Cursor(frame.body, "condition set").finish()
 
     def checkpoint_delete(
         self, number: int, *, timeout_ms: int = 10_000
@@ -1805,6 +1824,12 @@ class ViceBmpClient:
         pc = cur.u16()
         cur.finish()
         return pc
+
+    def acknowledge_autostart(self, filename: str, file_index: int, run: bool, *, timeout_ms: int) -> int:
+        frame = self.command(CMD_AUTOSTART, validate_autostart(filename, file_index, run),
+                             expected=RESP_AUTOSTART, timeout_ms=timeout_ms, mutating=True)
+        Cursor(frame.body, "autostart").finish()
+        return frame.request_id
 
     def acknowledge_step(
         self, count: int, step_over: bool, *, timeout_ms: int

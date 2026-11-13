@@ -2,11 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- Conditional checkpoints, stopped-target resource access, and VICE autostart through TraceRMI.
+
 ## 0.105.0
 ### Added
 
 - Bounded, read-only main-CPU history through TraceRMI.
-
 - TraceRMI methods for advancing observed frames and running to an address with a frame limit on stock VICE.
 
 ## 0.104.0

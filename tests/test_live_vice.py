@@ -463,3 +463,25 @@ class TestLiveConcurrency:
             pc = regs['PC']
             data = vice.memory_get(pc, min(pc + 3, 0xFFFF))
             assert len(data) > 0
+
+
+def test_conditioned_autostart_fixture(vice):
+    from pathlib import Path
+
+    filename = str((Path(__file__).parent / "fixtures" / "loop.prg").resolve())
+    controller = vice.controller
+    _, (checkpoint, _) = controller.set_checkpoint(0x0815, 0x0815, condition="A == $02")
+    try:
+        assert checkpoint.has_condition
+        assert controller.autostart(filename).event.kind == "resumed"
+        deadline = time.monotonic() + 15
+        while controller.execution_state != "stopped" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert controller.execution_state == "stopped"
+        assert vice.registers_get(0)["A"] == 2
+        records = controller.list_checkpoints()[1]
+        assert next(item for item in records if item.number == checkpoint.number).hit_count == 1
+    finally:
+        if controller.execution_state == "running":
+            controller.interrupt()
+        controller.delete_checkpoint(checkpoint.number)

@@ -6,9 +6,9 @@ A Ghidra 12.2 debugger extension for the Commodore 64. It connects one Ghidra Tr
 
 - registers, banks, and the full 64 KiB address space;
 - step, next, finish, resume, interrupt, and reset;
-- execute breakpoints and read/write watchpoints;
+- conditional execute breakpoints and read/write watchpoints;
 - deterministic keyboard and joystick input;
-- VICE snapshots;
+- VICE snapshots, resources, and autostart;
 - a bounded composited-display capture;
 - a small `c64.vice/1` TraceRMI method surface used by `c64-mcp`.
 
@@ -17,6 +17,10 @@ The controller serializes monitor commands and publishes VICE stop/resume events
 Automation can read bounded main-CPU instruction history while stopped. VICE must be built with `--enable-cpuhistory`. Entries are oldest to newest, with pre-instruction registers and fetch-start cycles; cycles can decrease across resets or snapshot restores. The three saved instruction-prefix bytes are not a decoded instruction length, and unused operand slots may contain zero or neighboring bytes.
 
 Automation can advance observed frames or run until an address with a frame limit. A frame is the first CPU instruction boundary observed on raster line 0 after a nonzero line; long REU DMA can skip an observation. Both operations start stopped, publish one final stop after helper checkpoint cleanup, and return partial progress on timeout after recovery. An already-current target returns without another stop.
+
+Automation can get and set individual VICE resources while stopped. Writes to monitor-server configuration are blocked, and log resources are protected while a native trace owns them. Checkpoint conditions use native VICE expressions; if VICE rejects a condition, the newly created checkpoint is deleted when possible.
+
+Autostart takes an absolute path on VICE's filesystem and returns when VICE resumes after scheduling the load. `run` controls BASIC RUN after loading. A rejected autostart can also resume execution; snapshot autostart can subsequently stop again. Use execution events and checkpoints to observe readiness.
 
 Automation can start and stop a native monitor log for inclusive main-memory ranges. The controller owns the trace checkpoints and restores the previous monitor log filename on stop.
 
