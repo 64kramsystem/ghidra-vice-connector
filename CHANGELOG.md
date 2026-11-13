@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+## 0.105.0
 ### Added
 
 - Bounded, read-only main-CPU history through TraceRMI.
