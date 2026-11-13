@@ -465,6 +465,10 @@ class TestLiveConcurrency:
             assert len(data) > 0
 
 
+@pytest.mark.skipif(
+    os.environ.get("VICE_ISOLATED") != "1" or "VICE_PORT" not in os.environ or VICE_PORT == 6502,
+    reason="requires explicitly isolated VICE on a non-default port",
+)
 def test_conditioned_autostart_fixture(vice):
     from pathlib import Path
 
@@ -485,3 +489,27 @@ def test_conditioned_autostart_fixture(vice):
         if controller.execution_state == "running":
             controller.interrupt()
         controller.delete_checkpoint(checkpoint.number)
+
+
+@pytest.mark.skipif(
+    os.environ.get("VICE_ISOLATED") != "1" or "VICE_PORT" not in os.environ or VICE_PORT == 6502,
+    reason="requires explicitly isolated VICE on a non-default port",
+)
+def test_autostart_and_condition_rejections(vice, tmp_path):
+    from pathlib import Path
+    from vice.protocol import ViceCommandError
+
+    controller = vice.controller
+    before = {cp.number for cp in controller.list_checkpoints()[1]}
+    with pytest.raises(ViceCommandError):
+        controller.set_checkpoint(0x0815, 0x0815, condition="!!!")
+    assert {cp.number for cp in controller.list_checkpoints()[1]} == before
+    filename = str((Path(__file__).parent / "fixtures" / "loop.prg").resolve())
+    assert controller.autostart(filename, run=False).event.kind == "resumed"
+    if controller.execution_state == "running":
+        controller.interrupt()
+    with pytest.raises(ViceCommandError) as caught:
+        controller.autostart(str(tmp_path / "missing.prg"))
+    assert caught.value.state_may_have_changed
+    assert controller.execution_state == "running"
+    controller.interrupt()

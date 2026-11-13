@@ -419,12 +419,15 @@ class ViceController:
             except ViceFailure as exc:
                 # A rejected or locally invalid command did not change VICE
                 # execution. Timeouts and transport failures remain unknown.
-                if rejection_may_resume and isinstance(exc, ViceCommandError):
+                if (rejection_may_resume and isinstance(exc, ViceCommandError)
+                        and exc.error == 0x8f):
                     exc.state_may_have_changed = True
                     try:
                         while True:
                             raw = self._pop_raw(deadline, require=True)
-                            self._publish(raw, action_applied=True, deadline=deadline)
+                            self._publish(
+                                raw, action_applied=raw.raw_sequence > watermark, deadline=deadline
+                            )
                             if raw.raw_sequence > watermark and raw.kind == "resumed":
                                 break
                     except ViceTimeoutError:
