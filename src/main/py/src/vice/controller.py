@@ -25,6 +25,9 @@ from .protocol import (
     RawEvent,
     ViceBmpClient,
     ViceConnectionError,
+    ViceCommandError,
+    validate_condition,
+    validate_autostart,
     ViceFailure,
     ViceProtocolError,
     ViceTimeoutError,
@@ -390,6 +393,7 @@ class ViceController:
         *,
         timeout_ms: int,
         precondition: str = "stopped",
+        rejection_may_resume: bool = False,
     ) -> OperationResult:
         if not 1 <= timeout_ms <= 55_000:
             raise ViceValidationError("timeout_ms must be in 1..55000")
@@ -415,7 +419,20 @@ class ViceController:
             except ViceFailure as exc:
                 # A rejected or locally invalid command did not change VICE
                 # execution. Timeouts and transport failures remain unknown.
-                if not exc.outcome_unknown:
+                if (rejection_may_resume and isinstance(exc, ViceCommandError)
+                        and exc.error == 0x8f):
+                    exc.state_may_have_changed = True
+                    try:
+                        while True:
+                            raw = self._pop_raw(deadline, require=True)
+                            self._publish(
+                                raw, action_applied=raw.raw_sequence > watermark, deadline=deadline
+                            )
+                            if raw.raw_sequence > watermark and raw.kind == "resumed":
+                                break
+                    except ViceTimeoutError:
+                        pass
+                elif not exc.outcome_unknown:
                     with self._condition:
                         if self._connection_state == "connected":
                             self._execution_state = precondition
@@ -639,6 +656,15 @@ class ViceController:
                 timeout_ms=remaining
             ),
             timeout_ms=timeout_ms,
+        )
+
+    def autostart(self, filename: str, file_index: int = 0, run: bool = True,
+                  *, timeout_ms: int = 10_000) -> OperationResult:
+        validate_autostart(filename, file_index, run)
+        return self._execution_operation(
+            ("resumed",),
+            lambda remaining: self.client.acknowledge_autostart(filename, file_index, run, timeout_ms=remaining),
+            timeout_ms=timeout_ms, rejection_may_resume=True,
         )
 
     def interrupt(self, *, timeout_ms: int = 10_000) -> OperationResult:
@@ -1172,6 +1198,21 @@ class ViceController:
         return (cp.start, cp.end, cp.stop_on_hit, cp.cpu_op,
                 cp.temporary, cp.memspace)
 
+    def get_resource(self, name: str, *, timeout_ms: int = 10_000):
+        return self._stopped_call(lambda remaining: self.client.resource_get(name, timeout_ms=remaining()),
+                                  timeout_ms=timeout_ms)
+
+    def set_resource(self, name: str, value: str, *, timeout_ms: int = 10_000):
+        if isinstance(name, str) and name.lower() in {
+            "binarymonitorserver", "binarymonitorserveraddress", "monitorserver", "monitorserveraddress"
+        }:
+            raise ViceValidationError("monitor server resources cannot be changed")
+        def configure(remaining):
+            if self._native_trace is not None and isinstance(name, str) and name.lower() in {"monitorlogenabled", "monitorlogfilename"}:
+                raise ViceValidationError("resource is owned by the active native trace")
+            self.client.resource_set_string(name, value, timeout_ms=remaining())
+        return self._stopped_call(configure, timeout_ms=timeout_ms)
+
     def list_checkpoints(
         self, *, timeout_ms: int = 10_000
     ) -> Tuple[int, List[Checkpoint]]:
@@ -1193,8 +1234,13 @@ class ViceController:
         cpu_op: int = CPU_OP_EXEC,
         temporary: bool = False,
         memspace: int = MEMSPACE_MAIN,
+        condition: str = "",
         timeout_ms: int = 10_000,
     ) -> Tuple[int, Tuple[Checkpoint, List[Checkpoint]]]:
+        if not isinstance(condition, str):
+            raise ViceValidationError("condition must be a string")
+        if condition:
+            validate_condition(condition)
         def create_and_list(remaining):
             checkpoint = self.client.checkpoint_set(
                 start,
@@ -1206,14 +1252,26 @@ class ViceController:
                 memspace,
                 timeout_ms=remaining(),
             )
+            if condition:
+                try:
+                    self.client.checkpoint_condition(checkpoint.number, condition, timeout_ms=remaining())
+                except ViceCommandError as exc:
+                    try:
+                        self.client.checkpoint_delete(checkpoint.number, timeout_ms=remaining())
+                    except ViceFailure as cleanup:
+                        exc.checkpoint_ids = [checkpoint.number]
+                        exc.state_may_have_changed = True
+                        exc.cleanup_error = str(cleanup)
+                    raise
+                except ViceFailure as exc:
+                    exc.checkpoint_ids = [checkpoint.number]
+                    exc.state_may_have_changed = True
+                    raise
             try:
-                checkpoints = self.client.checkpoint_list(
-                    timeout_ms=remaining()
-                )
+                checkpoints = self.client.checkpoint_list(timeout_ms=remaining())
+                checkpoint = next(cp for cp in checkpoints if cp.number == checkpoint.number)
             except BaseException as exc:
-                raise self._post_action_sync_error(
-                    "checkpoint_change", exc
-                ) from exc
+                raise self._post_action_sync_error("checkpoint_change", exc) from exc
             return checkpoint, checkpoints
 
         return self._stopped_call(

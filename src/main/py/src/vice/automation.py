@@ -172,6 +172,7 @@ def _failure(controller: ViceController, command: str, error: ViceFailure) -> st
         "unknown_checkpoint",
         "unknown_delete",
         "cleanup_complete",
+        "cleanup_error",
         "resume_error",
     ):
         if hasattr(error, name):
@@ -405,6 +406,29 @@ def stop_trace(process: C64, trace_id: str, timeout_ms: int = 10_000) -> str:
         trace_id, timeout_ms=timeout_ms))
 
 
+@REGISTRY.method(name="c64_vice_v1_get_resource")
+def get_resource(process: C64, name: str, timeout_ms: int = 10_000) -> str:
+    def invoke(controller):
+        sequence, value = controller.get_resource(name, timeout_ms=timeout_ms)
+        return sequence, {"name": name, "value": value}
+    return _call(process, "get_resource", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_set_resource")
+def set_resource(process: C64, name: str, value: str, timeout_ms: int = 10_000) -> str:
+    def invoke(controller):
+        sequence, _ = controller.set_resource(name, value, timeout_ms=timeout_ms)
+        return sequence, {"name": name}
+    return _call(process, "set_resource", invoke)
+
+
+@REGISTRY.method(name="c64_vice_v1_autostart")
+def autostart(process: C64, filename: str, file_index: int = 0, run: bool = True,
+              timeout_ms: int = 10_000) -> str:
+    return _execution_call(process, "autostart", lambda controller: controller.autostart(
+        filename, file_index, run, timeout_ms=timeout_ms))
+
+
 @REGISTRY.method(name="c64_vice_v1_list_checkpoints")
 def list_checkpoints(process: C64, timeout_ms: int = 10_000) -> str:
     def invoke(controller):
@@ -428,6 +452,7 @@ def set_checkpoint(
     operations: int = 4,
     temporary: bool = False,
     memspace: int = 0,
+    condition: str = "",
     timeout_ms: int = 10_000,
 ) -> str:
     def invoke(controller):
@@ -439,6 +464,7 @@ def set_checkpoint(
             cpu_op=operations,
             temporary=temporary,
             memspace=memspace,
+            condition=condition,
             timeout_ms=timeout_ms,
         )
         checkpoint, _all = result

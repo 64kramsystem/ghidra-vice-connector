@@ -298,7 +298,7 @@ def test_composite_checkpoint_calls_share_one_timeout_budget():
 
     def checkpoint_list(*, timeout_ms):
         budgets.append(timeout_ms)
-        return []
+        return [Checkpoint(1, 0x1000, 0x1000)]
 
     client.checkpoint_set = checkpoint_set
     client.checkpoint_list = checkpoint_list
@@ -693,3 +693,98 @@ def test_cpu_history_requires_stopped_and_serializes_without_trace_sync():
     with pytest.raises(ViceStateError):
         controller.cpu_history(3)
     assert client.cpu_history.call_count == 1
+
+def test_conditioned_checkpoint_is_configured_and_refreshed():
+    client, controller = connected_controller()
+    cp = Checkpoint(7, 0x1000, 0x1000)
+    client.checkpoint_set = MagicMock(return_value=cp)
+    client.checkpoint_condition = MagicMock()
+    client.checkpoint_list = MagicMock(return_value=[cp])
+    sequence, (result, _) = controller.set_checkpoint(0x1000, 0x1000, condition="A == $02")
+    assert sequence > 0 and result == cp
+    client.checkpoint_condition.assert_called_once()
+    assert client.checkpoint_condition.call_args.args == (7, "A == $02")
+    controller.close()
+
+
+def test_rejected_condition_deletes_created_checkpoint():
+    from vice.protocol import ViceCommandError
+    client, controller = connected_controller()
+    client.checkpoint_set = MagicMock(return_value=Checkpoint(7, 0x1000, 0x1000))
+    client.checkpoint_condition = MagicMock(side_effect=ViceCommandError(1, command=0x22, request_id=2))
+    client.checkpoint_delete = MagicMock()
+    with pytest.raises(ViceCommandError):
+        controller.set_checkpoint(0x1000, 0x1000, condition="invalid")
+    assert client.checkpoint_delete.call_args.args == (7,)
+    controller.close()
+
+
+def test_resource_guard_and_autostart_events():
+    client, controller = connected_controller()
+    client.resource_set_string = MagicMock()
+    for name in ("BinaryMonitorServer", "BinaryMonitorServerAddress", "MonitorServer", "MonitorServerAddress", "binarymonitorserver"):
+        with pytest.raises(ViceValidationError):
+            controller.set_resource(name, "1")
+    controller._native_trace = {}
+    with pytest.raises(ViceValidationError):
+        controller.set_resource("MonitorLogEnabled", "0")
+    controller._native_trace = None
+    client.acknowledge_autostart = lambda *args, timeout_ms: client._ack("autostart", timeout_ms)
+    client.next_events = [raw(1, "resumed"), raw(2, "stopped")]
+    result = controller.autostart("/tmp/program.prg")
+    assert result.event.kind == "resumed"
+    controller._drain_pending(time.monotonic() + 1, through=controller._raw_watermark())
+    assert controller.execution_state == "stopped"
+    controller.close()
+
+
+def test_rejected_autostart_publishes_actual_resume():
+    from vice.protocol import ViceCommandError
+    client, controller = connected_controller()
+    def reject(*args, timeout_ms):
+        client.emit(raw(1, "resumed"))
+        raise ViceCommandError(0x8f, command=0xdd, request_id=8)
+    client.acknowledge_autostart = reject
+    with pytest.raises(ViceCommandError) as caught:
+        controller.autostart("/tmp/missing.prg", timeout_ms=1000)
+    assert caught.value.state_may_have_changed
+    assert controller.execution_state == "running"
+    controller.close()
+
+
+def test_other_autostart_rejection_preserves_stopped_state():
+    from vice.protocol import ViceCommandError
+    client, controller = connected_controller()
+    client.acknowledge_autostart = MagicMock(side_effect=ViceCommandError(1, command=0xdd, request_id=8))
+    with pytest.raises(ViceCommandError):
+        controller.autostart("/tmp/missing.prg", timeout_ms=1000)
+    assert controller.execution_state == "stopped"
+    controller.close()
+
+
+def test_rejected_condition_cleanup_failure_reports_checkpoint():
+    from vice.protocol import ViceCommandError
+    client, controller = connected_controller()
+    client.checkpoint_set = MagicMock(return_value=Checkpoint(7, 0x1000, 0x1000))
+    client.checkpoint_condition = MagicMock(side_effect=ViceCommandError(0x8f, command=0x22, request_id=2))
+    client.checkpoint_delete = MagicMock(side_effect=ViceValidationError("cleanup failed"))
+    with pytest.raises(ViceCommandError) as caught:
+        controller.set_checkpoint(0x1000, 0x1000, condition="invalid")
+    assert caught.value.checkpoint_ids == [7]
+    assert caught.value.state_may_have_changed is True
+    assert caught.value.cleanup_error == "cleanup failed"
+    controller.close()
+
+
+def test_rejected_autostart_marks_only_new_events_as_applied():
+    from vice.protocol import ViceCommandError
+    client, controller = connected_controller()
+    client.acknowledge_autostart = MagicMock(side_effect=ViceCommandError(0x8f, command=0xdd, request_id=8))
+    controller._drain_pending = MagicMock()
+    controller._raw_watermark = MagicMock(return_value=10)
+    controller._pop_raw = MagicMock(side_effect=[raw(9, "stopped"), raw(11, "resumed")])
+    controller._publish = MagicMock()
+    with pytest.raises(ViceCommandError):
+        controller.autostart("/tmp/missing.prg", timeout_ms=1000)
+    assert [call.kwargs["action_applied"] for call in controller._publish.call_args_list] == [False, True]
+    controller.close()

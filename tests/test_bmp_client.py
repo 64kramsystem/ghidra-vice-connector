@@ -616,3 +616,20 @@ def test_cpu_history_wire_and_strict_records(connected_client):
     for invalid in (True, 0, 4097):
         with pytest.raises(ViceValidationError):
             client.cpu_history(invalid)
+
+def test_condition_and_autostart_frames(connected_client):
+    client, server = connected_client
+    seen = []
+    server.handle(0x22, lambda body: seen.append(body) or (0x22, b""))
+    server.handle(0xdd, lambda body: seen.append(body) or (0xdd, b""))
+    client.checkpoint_condition(7, "A == $02")
+    client.acknowledge_autostart("/tmp/a.prg", 2, True, timeout_ms=1000)
+    assert seen == [struct.pack("<IB", 7, 8) + b"A == $02",
+                    struct.pack("<BHB", 1, 2, 10) + b"/tmp/a.prg"]
+    with pytest.raises(ViceValidationError):
+        client.checkpoint_condition(7, "A;quit")
+    with pytest.raises(ViceValidationError):
+        client.acknowledge_autostart("relative", 0, True, timeout_ms=1000)
+    server.handle(0x22, lambda body: (0x22, b"unexpected"))
+    with pytest.raises(ViceProtocolError):
+        client.checkpoint_condition(7, "A == 2")
